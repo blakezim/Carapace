@@ -291,7 +291,7 @@ sudo cat > /Library/LaunchDaemons/ai.carapace.gateway.plist << 'EOF'
     <key>UserName</key>
     <string>carapace</string>
     <key>GroupName</key>
-    <string>carapace</string>
+    <string>carapace-clients</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

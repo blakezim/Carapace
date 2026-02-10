@@ -65,7 +65,7 @@ prompt_yn() {
         read -rp "$(echo -e "${YELLOW}${prompt} [y/N]:${RESET} ")" yn
         yn="${yn:-n}"
     fi
-    [[ "${yn,,}" == "y" ]]
+    [[ "$yn" == [yY] ]]
 }
 
 check_cmd() {
@@ -547,7 +547,7 @@ write_launch_daemon() {
     <string>carapace</string>
 
     <key>GroupName</key>
-    <string>carapace</string>
+    <string>carapace-clients</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -583,6 +583,39 @@ start_and_test() {
     header "Phase 7: Start Daemon & Run Tests"
 
     local plist_path="/Library/LaunchDaemons/ai.carapace.gateway.plist"
+    local data_dir="/Users/$CARAPACE_USER/.local/share/carapace"
+    local log_file="$data_dir/daemon.log"
+    local err_file="$data_dir/daemon.err"
+
+    # ── Pre-flight: validate plist references ──
+    info "Validating LaunchDaemon plist..."
+
+    local plist_user plist_group
+    plist_user="$(/usr/libexec/PlistBuddy -c "Print :UserName" "$plist_path" 2>/dev/null || echo "")"
+    plist_group="$(/usr/libexec/PlistBuddy -c "Print :GroupName" "$plist_path" 2>/dev/null || echo "")"
+
+    if [[ -n "$plist_user" ]] && ! id "$plist_user" &>/dev/null; then
+        fail "Plist UserName '$plist_user' does not exist as a macOS user"
+        fail "Fix the plist or re-run: $0 --phase 6"
+        return
+    fi
+
+    if [[ -n "$plist_group" ]] && ! dseditgroup -o read "$plist_group" &>/dev/null; then
+        fail "Plist GroupName '$plist_group' does not exist as a macOS group"
+        fail "launchd will silently refuse to start the daemon with a non-existent group."
+        fail "Fix the plist or re-run: $0 --phase 6"
+        return
+    fi
+
+    local daemon_bin
+    daemon_bin="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$plist_path" 2>/dev/null || echo "")"
+    if [[ -n "$daemon_bin" ]] && [[ ! -x "$daemon_bin" ]]; then
+        fail "Daemon binary not found or not executable: $daemon_bin"
+        fail "Re-run: $0 --phase 5"
+        return
+    fi
+
+    success "Plist OK (user=$plist_user, group=$plist_group, bin=$daemon_bin)"
 
     # Check group membership first
     if ! groups "$(whoami)" | grep -q "$CARAPACE_GROUP"; then
@@ -611,27 +644,69 @@ start_and_test() {
         sudo rm -f "$SOCKET_PATH"
     fi
 
+    # Truncate old logs so we only see output from this launch attempt
+    sudo -u "$CARAPACE_USER" truncate -s 0 "$log_file" 2>/dev/null || true
+    sudo -u "$CARAPACE_USER" truncate -s 0 "$err_file" 2>/dev/null || true
+
     # Start daemon
     info "Starting daemon via LaunchDaemon..."
     sudo launchctl load "$plist_path"
     sleep 2
 
-    # Verify daemon is running
-    if sudo launchctl list | grep -q "ai.carapace.gateway"; then
-        success "Daemon is running"
-    else
-        fail "Daemon did not start. Check logs:"
-        echo "  sudo -u carapace cat /Users/carapace/.local/share/carapace/daemon.err"
+    # ── Verify daemon is actually alive (not just loaded) ──
+    # launchctl list format: PID<tab>Status<tab>Label
+    # A "-" PID means the process is not running. Non-zero status means it exited with an error.
+    local lctl_line
+    lctl_line="$(sudo launchctl list | grep "ai.carapace.gateway" || echo "")"
+
+    if [[ -z "$lctl_line" ]]; then
+        fail "Daemon is not loaded. launchctl load may have failed."
+        echo "  Try: sudo launchctl load $plist_path"
         return
     fi
+
+    local daemon_pid lctl_status
+    daemon_pid="$(echo "$lctl_line" | awk '{print $1}')"
+    lctl_status="$(echo "$lctl_line" | awk '{print $2}')"
+
+    if [[ "$daemon_pid" == "-" ]]; then
+        fail "Daemon loaded but process is not running (exit status: $lctl_status)"
+        echo ""
+        if [[ -s "$err_file" ]]; then
+            echo -e "  ${DIM}── daemon stderr ──${RESET}"
+            sudo -u "$CARAPACE_USER" tail -20 "$err_file" 2>/dev/null | sed 's/^/  /'
+        elif [[ -s "$log_file" ]]; then
+            echo -e "  ${DIM}── daemon stdout ──${RESET}"
+            sudo -u "$CARAPACE_USER" tail -20 "$log_file" 2>/dev/null | sed 's/^/  /'
+        else
+            echo "  No log output found. launchd likely could not start the process at all."
+            echo "  Common causes:"
+            echo "    • GroupName in plist references a non-existent group"
+            echo "    • UserName in plist references a non-existent user"
+            echo "    • The daemon binary is missing or not executable"
+            echo ""
+            echo "  Debug with: sudo launchctl print system/ai.carapace.gateway"
+        fi
+        return
+    fi
+
+    success "Daemon is running (pid: $daemon_pid)"
 
     # Verify socket exists
     if [[ -S "$SOCKET_PATH" ]]; then
         success "Socket exists: $(ls -l "$SOCKET_PATH")"
     else
         fail "Socket not found at $SOCKET_PATH"
-        echo "  Check daemon logs:"
-        echo "  sudo -u carapace tail -20 /Users/carapace/.local/share/carapace/daemon.err"
+        echo ""
+        if [[ -s "$err_file" ]]; then
+            echo -e "  ${DIM}── daemon stderr ──${RESET}"
+            sudo -u "$CARAPACE_USER" tail -20 "$err_file" 2>/dev/null | sed 's/^/  /'
+        elif [[ -s "$log_file" ]]; then
+            echo -e "  ${DIM}── daemon stdout ──${RESET}"
+            sudo -u "$CARAPACE_USER" tail -20 "$log_file" 2>/dev/null | sed 's/^/  /'
+        else
+            echo "  No daemon log output found."
+        fi
         return
     fi
 
