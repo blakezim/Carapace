@@ -50,16 +50,42 @@ sudo sysadminctl -addUser carapace \
 3. Open **Messages.app** and verify it activates
 4. Open **Terminal** and grant it **Full Disk Access**:
    - System Settings → Privacy & Security → Full Disk Access → add Terminal
-5. Install the `imsg` CLI tool:
-   ```bash
-   brew install steipete/tap/imsg
-   ```
-6. Create config directories:
+5. Create config directories:
    ```bash
    mkdir -p ~/.config/carapace
    mkdir -p ~/.local/share/carapace
+   mkdir -p ~/.local/bin
    ```
-7. **Log out** of the carapace account
+6. **Log out** of the carapace account
+
+### Install imsg (From Your Main Account)
+
+Homebrew is owned by your main user, so install `imsg` there and copy the
+binary into the carapace user's private bin. This way only the carapace
+user can execute it — the AI (running as your user) physically cannot.
+
+```bash
+# Install to get the binary
+brew install steipete/tap/imsg
+
+# Copy into carapace's home, locked to carapace-only
+# (uses `which imsg` so it works on both Intel and Apple Silicon Macs)
+sudo cp "$(which imsg)" /Users/carapace/.local/bin/imsg
+sudo chown carapace /Users/carapace/.local/bin/imsg
+sudo chmod 700 /Users/carapace/.local/bin/imsg
+
+# Remove from your main account (recommended)
+brew uninstall imsg
+```
+
+Verify it's locked down:
+```bash
+# This should fail with "permission denied" — that's correct!
+/Users/carapace/.local/bin/imsg --help
+
+# This should work:
+sudo -u carapace /Users/carapace/.local/bin/imsg --help
+```
 
 ### Hide from Login Screen (Optional)
 

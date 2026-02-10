@@ -113,9 +113,11 @@ install_dependencies() {
         info "Installing Homebrew..."
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-        # Add to PATH for Apple Silicon
+        # Add to PATH (Apple Silicon: /opt/homebrew, Intel: /usr/local)
         if [[ -f /opt/homebrew/bin/brew ]]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [[ -f /usr/local/bin/brew ]]; then
+            eval "$(/usr/local/bin/brew shellenv)"
         fi
         success "Homebrew installed"
     fi
@@ -197,24 +199,52 @@ create_carapace_user() {
     echo "  4. Open Messages.app and verify it activates"
     echo "  5. Grant Full Disk Access to Terminal:"
     echo "     System Settings → Privacy & Security → Full Disk Access → add Terminal"
-    echo "  6. Install imsg:"
-    echo "     brew install steipete/tap/imsg"
-    echo "  7. Create config directories:"
-    echo "     mkdir -p ~/.config/carapace ~/.local/share/carapace"
-    echo "  8. Log out of the carapace account"
+    echo "  6. Create config directories:"
+    echo "     mkdir -p ~/.config/carapace ~/.local/share/carapace ~/.local/bin"
+    echo "  7. Log out of the carapace account"
     echo ""
 
     prompt_continue
 
-    # Verify the manual steps were done
-    info "Verifying carapace user setup..."
-    if sudo -u "$CARAPACE_USER" test -f /opt/homebrew/bin/imsg 2>/dev/null; then
-        success "imsg is installed for carapace user"
+    # Install imsg into the carapace user's private bin directory.
+    # Homebrew is owned by the main user, so we install there first
+    # then copy the binary to a location only carapace can access.
+    info "Setting up imsg for the carapace user..."
+
+    local imsg_target="/Users/$CARAPACE_USER/.local/bin/imsg"
+
+    if sudo -u "$CARAPACE_USER" test -f "$imsg_target" 2>/dev/null; then
+        success "imsg already installed at $imsg_target"
     else
-        warn "imsg not found at /opt/homebrew/bin/imsg for the carapace user."
-        warn "Make sure to install it (brew install steipete/tap/imsg) as the carapace user"
-        warn "before using iMessage features. Continuing anyway..."
-        echo ""
+        # Make sure imsg is available via Homebrew on the main account
+        if ! check_cmd imsg; then
+            info "Installing imsg via Homebrew (on your account, to grab the binary)..."
+            brew install steipete/tap/imsg
+        fi
+
+        local imsg_src
+        imsg_src="$(which imsg 2>/dev/null || echo "$(brew --prefix 2>/dev/null || echo /usr/local)/bin/imsg")"
+
+        if [[ -f "$imsg_src" ]]; then
+            info "Copying imsg to $imsg_target (carapace-only access)..."
+            sudo mkdir -p "/Users/$CARAPACE_USER/.local/bin"
+            sudo cp "$imsg_src" "$imsg_target"
+            sudo chown "$CARAPACE_USER" "$imsg_target"
+            sudo chmod 700 "$imsg_target"
+            success "imsg installed at $imsg_target (owned by carapace, mode 700)"
+
+            if prompt_yn "Remove imsg from your main account? (recommended for isolation)" "y"; then
+                brew uninstall imsg 2>/dev/null || true
+                success "imsg removed from main account"
+            fi
+        else
+            warn "Could not find imsg binary. Install it manually:"
+            warn "  brew install steipete/tap/imsg"
+            warn "  sudo cp \$(which imsg) $imsg_target"
+            warn "  sudo chown carapace $imsg_target"
+            warn "  sudo chmod 700 $imsg_target"
+            echo ""
+        fi
     fi
 }
 
@@ -440,7 +470,7 @@ action  = "block"                 # SSN pattern
 # ── iMessage ───────────────────────────────────────────────────────────────
 [channels.imsg]
 enabled     = true
-real_binary = "/opt/homebrew/bin/imsg"
+real_binary = "/Users/carapace/.local/bin/imsg"
 db_path     = "/Users/carapace/Library/Messages/chat.db"
 
 [channels.imsg.outbound]
@@ -460,7 +490,7 @@ allowlist = [
 # ── Signal (uncomment to enable) ──────────────────────────────────────────
 # [channels.signal]
 # enabled         = true
-# signal_cli_path = "/opt/homebrew/bin/signal-cli"
+# signal_cli_path = "/usr/local/bin/signal-cli"
 # account         = "+1YOURPHONENUMBER"
 #
 # [channels.signal.outbound]
