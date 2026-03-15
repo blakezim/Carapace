@@ -1,0 +1,45 @@
+# Dev/testing config — use with:
+#   carapace-daemon --socket /tmp/carapace-test.sock --config ./config.dev.toml
+
+[gateway]
+socket_path = "/tmp/carapace-test.sock"
+
+[security]
+audit_log_path = "/tmp/carapace-audit.log"
+dead_letter_path = "/tmp/carapace-dead-letters"
+audit_enabled = true
+
+[security.rate_limit]
+default = { requests = 5, per_seconds = 60 }
+
+[security.content_filter]
+enabled = true
+
+[[security.content_filter.patterns]]
+pattern = '(?i)password\s*[:=]'
+action = "block"
+
+[[security.content_filter.patterns]]
+pattern = '(?i)api[_-]?key\s*[:=]'
+action = "block"
+
+[[security.content_filter.patterns]]
+pattern = '\b\d{3}-\d{2}-\d{4}\b'
+action = "block"
+
+# ── iMessage channel ─────────────────────────────────────────────────────────
+
+[channels.imsg]
+enabled = true
+real_binary = "/Users/carapace/.local/bin/imsg"
+db_path = "/Users/carapace/Library/Messages/chat.db"
+
+[channels.imsg.outbound]
+mode = "allowlist"
+allowlist = [
+    "+1234567890",
+    "friend@icloud.com",
+]
+
+[channels.imsg.inbound]
+mode = "open"

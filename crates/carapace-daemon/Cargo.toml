@@ -12,4 +12,10 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml.workspace = true
+regex.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+carapace-client = { path = "../carapace-client" }
+tempfile = "3"

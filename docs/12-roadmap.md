@@ -19,16 +19,16 @@ Phase 1: Create carapace user (GUI)
 Phase 2: Configure main account (permissions)
     │
     ▼
-Phase 3: Gateway infrastructure (socket IPC)  ◄── YOU ARE HERE
+Phase 3: Gateway infrastructure (socket IPC)  ✅
     │
     ▼
-Phase 4: Security middleware (filtering)
+Phase 4: Security middleware (filtering)       ✅
     │
     ▼
-Phase 5: iMessage adapter (first channel)
+Phase 5: iMessage adapter (first channel)      ✅
     │
     ▼
-Phase 6: Additional channels (Signal, Discord, Gmail)
+Phase 6: Additional channels (Signal, Discord, Gmail) ◄── YOU ARE HERE
     │
     ▼
 Phase 7: Production hardening
@@ -78,11 +78,11 @@ Phase 9: OpenClaw integration
 
 ---
 
-## Phase 3: Gateway Infrastructure 🚧
+## Phase 3: Gateway Infrastructure ✅
 
 **Goal:** Establish basic communication between users via Unix socket
 
-**Status:** IN PROGRESS
+**Status:** Complete
 
 This is the foundational piece. Before we add security middleware or channel adapters, we need to understand how two processes (running as different users) communicate.
 
@@ -248,22 +248,22 @@ This proves the core concept: **your account sends a request, carapace account e
 
 ### Phase 3 Deliverables
 
-- [ ] Daemon that listens on Unix socket
-- [ ] JSON-RPC request/response handling
-- [ ] Client library for connecting to daemon
-- [ ] Test shim that verifies connectivity
-- [ ] Passthrough command execution
-- [ ] Documentation of what we learned
+- [x] Daemon that listens on Unix socket
+- [x] JSON-RPC request/response handling
+- [x] Client library for connecting to daemon
+- [x] Test shim that verifies connectivity
+- [x] Passthrough command execution
+- [x] Documentation of what we learned
 
-**See:** [13-gateway-infrastructure.md](13-gateway-infrastructure.md) (to be created)
+**See:** [13-gateway-infrastructure.md](13-gateway-infrastructure.md)
 
 ---
 
-## Phase 4: Security Middleware
+## Phase 4: Security Middleware ✅
 
 **Goal:** Add security controls between request and execution
 
-**Status:** Planned
+**Status:** Complete
 
 Once Phase 3 works, we add security layers:
 
@@ -294,35 +294,41 @@ Once Phase 3 works, we add security layers:
 
 ---
 
-## Phase 5: iMessage Adapter
+## Phase 5: iMessage Adapter ✅
 
 **Goal:** Replace generic passthrough with iMessage-specific handling
 
-**Status:** Planned
+**Status:** Complete
 
-### 5.1: Send Messages
+### 5.1: Send Messages ✅
 - Parse imsg send command format
 - Execute via real imsg
 - Format response
 
-### 5.2: List Chats
+### 5.2: List Chats ✅
 - Query via imsg chats
 - Filter by allowlist
 - Return formatted list
 
-### 5.3: Get History
+### 5.3: Get History ✅
 - Query specific chat
 - Filter messages
 - Return history
 
-### 5.4: Watch (Streaming)
-- Subscribe to new messages
+### 5.4: Watch (Streaming) ✅
+- Subscribe to new messages via `channel.watch`
 - Filter inbound by allowlist
-- Stream to client
+- Stream notifications to client over persistent connection
 
-### 5.5: imsg Shim
-- Full CLI compatibility
+### 5.5: imsg Shim ✅
+- Full CLI compatibility (send, chats, history, status, watch)
 - All imsg commands supported
+- JSON and human-readable output modes
+
+### 5.6: Integration Tests ✅
+- Mock `imsg` binary for deterministic testing
+- `TestDaemon` harness with auto-cleanup
+- 12 integration tests covering all methods + error paths
 
 **Outcome:** Drop-in replacement for imsg that goes through gateway
 
@@ -361,9 +367,9 @@ Once Phase 3 works, we add security layers:
 
 **Goal:** Make setup easy
 
-**Status:** Planned
+**Status:** Partially complete
 
-- [ ] Install script
+- [x] Install script
 - [ ] Management CLI (`carapace-ctl`)
 - [ ] Homebrew formula
 - [ ] Documentation improvements
@@ -382,17 +388,18 @@ Once Phase 3 works, we add security layers:
 
 ---
 
-## Current Focus: Phase 3
+## Current Focus: Phase 6
 
 **What to build next:**
 
-1. **Minimal daemon** (echo server) - ~30 lines of Rust
-2. **JSON-RPC parsing** - add structured protocol
-3. **Client library** - reusable connection code
-4. **Test shim** - verify end-to-end
-5. **Passthrough execution** - prove the concept
+1. **Signal adapter** — wrap `signal-cli` via `tokio::process::Command`
+2. **Signal shim** — CLI binary matching `signal-cli` interface
+3. **Discord adapter** — serenity-based bot adapter
+4. **Discord shim** — CLI binary for Discord messaging
+5. **Gmail adapter** — Google API-based email adapter
+6. **Gmail shim** — CLI binary for Gmail
 
-This gives us the foundation everything else builds on.
+Phase 5 completed the iMessage channel with full streaming support. Now we add more channels.
 
 ---
 

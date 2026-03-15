@@ -9,6 +9,11 @@ description = "Carapace test shim – exercises the full gateway flow"
 name = "test-shim"
 path = "src/bin/test_shim.rs"
 
+[[bin]]
+name = "imsg"
+path = "src/bin/imsg_shim.rs"
+
 [dependencies]
 carapace-client = { path = "../carapace-client" }
 serde_json.workspace = true
+clap.workspace = true

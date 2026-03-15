@@ -4,6 +4,7 @@
 //! Each message is a single line of JSON terminated by `\n`.
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 // ── Standard JSON-RPC error codes ──────────────────────────────────────────
 
@@ -104,6 +105,39 @@ impl JsonRpcResponse {
             }),
         }
     }
+}
+
+// ── Notification (server → client, no id) ─────────────────────────────
+
+/// A JSON-RPC 2.0 notification sent from server to client (no `id` field).
+#[derive(Debug, Serialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: impl Into<String>, params: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+// ── ProcessResult ─────────────────────────────────────────────────────
+
+/// What a handler returns: either a single response or a subscription stream.
+pub enum ProcessResult {
+    /// Normal request-response.
+    Response(JsonRpcResponse),
+    /// Streaming: an acknowledgment response plus a channel of notifications.
+    Subscription {
+        ack: JsonRpcResponse,
+        notifications: mpsc::Receiver<JsonRpcNotification>,
+    },
 }
 
 // ── Validation ─────────────────────────────────────────────────────────────

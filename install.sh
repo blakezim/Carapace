@@ -333,7 +333,8 @@ build_code() {
 
     # Verify binaries exist
     local daemon_bin="$SCRIPT_DIR/target/release/carapace-daemon"
-    local shim_bin="$SCRIPT_DIR/target/release/test-shim"
+    local test_shim_bin="$SCRIPT_DIR/target/release/test-shim"
+    local imsg_shim_bin="$SCRIPT_DIR/target/release/imsg"
 
     if [[ -f "$daemon_bin" ]]; then
         success "Built: carapace-daemon ($(du -h "$daemon_bin" | cut -f1))"
@@ -342,10 +343,17 @@ build_code() {
         exit 1
     fi
 
-    if [[ -f "$shim_bin" ]]; then
-        success "Built: test-shim ($(du -h "$shim_bin" | cut -f1))"
+    if [[ -f "$test_shim_bin" ]]; then
+        success "Built: test-shim ($(du -h "$test_shim_bin" | cut -f1))"
     else
-        fail "test-shim binary not found at $shim_bin"
+        fail "test-shim binary not found at $test_shim_bin"
+        exit 1
+    fi
+
+    if [[ -f "$imsg_shim_bin" ]]; then
+        success "Built: imsg ($(du -h "$imsg_shim_bin" | cut -f1))"
+    else
+        fail "imsg shim binary not found at $imsg_shim_bin"
         exit 1
     fi
 
@@ -371,6 +379,35 @@ install_binaries() {
     sudo cp "target/release/test-shim" "$SHIM_DIR/test-shim"
     sudo chmod 755 "$SHIM_DIR/test-shim"
     success "Test shim installed: $SHIM_DIR/test-shim"
+
+    # ── imsg shim ──
+    # This is the drop-in replacement that OpenClaw calls as "imsg".
+    # It routes through the gateway daemon, which calls the real imsg
+    # binary as the carapace user.
+    local imsg_dest="/usr/local/bin/imsg"
+    if [[ -f "$imsg_dest" ]]; then
+        # Check if it's already our shim or something else
+        if file "$imsg_dest" | grep -q "Mach-O"; then
+            # It's a compiled binary — could be our shim or the real imsg
+            warn "A binary already exists at $imsg_dest"
+            if prompt_yn "Replace with carapace imsg shim?" "y"; then
+                sudo cp "target/release/imsg" "$imsg_dest"
+                sudo chmod 755 "$imsg_dest"
+                success "imsg shim installed: $imsg_dest"
+            fi
+        else
+            # It's a script (e.g. Homebrew wrapper) — safe to replace
+            info "Replacing Homebrew wrapper at $imsg_dest with carapace shim..."
+            sudo cp "target/release/imsg" "$imsg_dest"
+            sudo chmod 755 "$imsg_dest"
+            success "imsg shim installed: $imsg_dest"
+        fi
+    else
+        info "Installing imsg shim to $imsg_dest..."
+        sudo cp "target/release/imsg" "$imsg_dest"
+        sudo chmod 755 "$imsg_dest"
+        success "imsg shim installed: $imsg_dest"
+    fi
 
     echo ""
 }
@@ -805,6 +842,33 @@ check_status() {
         success "Test shim installed at $SHIM_DIR/test-shim"
     else
         fail "Test shim not found at $SHIM_DIR/test-shim"
+        all_ok=false
+    fi
+
+    # imsg shim on PATH
+    if [[ -x "/usr/local/bin/imsg" ]]; then
+        if file "/usr/local/bin/imsg" | grep -q "Mach-O"; then
+            success "imsg shim installed at /usr/local/bin/imsg"
+        else
+            warn "imsg at /usr/local/bin/imsg is a script, not the compiled shim"
+            all_ok=false
+        fi
+    else
+        fail "imsg shim not found at /usr/local/bin/imsg"
+        all_ok=false
+    fi
+
+    # Real imsg binary (on carapace user)
+    local real_imsg="/Users/$CARAPACE_USER/.local/bin/imsg"
+    if sudo test -f "$real_imsg" 2>/dev/null; then
+        if sudo file "$real_imsg" 2>/dev/null | grep -q "Mach-O"; then
+            success "Real imsg binary at $real_imsg"
+        else
+            fail "Real imsg at $real_imsg is not a compiled binary (broken Homebrew wrapper?)"
+            all_ok=false
+        fi
+    else
+        fail "Real imsg binary missing at $real_imsg"
         all_ok=false
     fi
 

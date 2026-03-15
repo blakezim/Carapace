@@ -188,4 +188,60 @@ impl GatewayClient {
 
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }
+
+    /// Send a subscription request and enter streaming mode.
+    ///
+    /// Sends the JSON-RPC request, reads the acknowledgment, then returns
+    /// a `Subscription` that yields notification events until the stream ends.
+    ///
+    /// Consumes `self` because the connection enters streaming mode and cannot
+    /// be used for normal request-response calls afterward.
+    pub fn subscribe(
+        mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(serde_json::Value, Subscription), ClientError> {
+        let ack = self.call(method, params)?;
+        Ok((ack, Subscription { reader: self.reader }))
+    }
+}
+
+/// An iterator over streaming JSON-RPC notifications from the daemon.
+///
+/// Created by [`GatewayClient::subscribe`]. Reads newline-delimited JSON
+/// notifications until the server closes the connection (EOF).
+pub struct Subscription {
+    reader: BufReader<UnixStream>,
+}
+
+/// A parsed JSON-RPC notification from the daemon.
+#[derive(Deserialize)]
+struct RpcNotification {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[allow(dead_code)]
+    method: String,
+    params: serde_json::Value,
+}
+
+impl Iterator for Subscription {
+    type Item = Result<serde_json::Value, ClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => None, // EOF
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return self.next(); // skip blank lines
+                }
+                match serde_json::from_str::<RpcNotification>(trimmed) {
+                    Ok(notif) => Some(Ok(notif.params)),
+                    Err(e) => Some(Err(ClientError::Parse(format!("{e}: {line}")))),
+                }
+            }
+            Err(e) => Some(Err(ClientError::Io(e))),
+        }
+    }
 }

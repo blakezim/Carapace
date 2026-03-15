@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use tracing::{info, warn};
 
 use crate::protocol::{self, JsonRpcRequest, JsonRpcResponse};
@@ -145,6 +145,7 @@ fn handle_execute(req: &JsonRpcRequest) -> JsonRpcResponse {
 mod tests {
     use super::*;
     use crate::protocol::JsonRpcRequest;
+    use serde_json::Value;
 
     fn make_request(method: &str, params: Value) -> JsonRpcRequest {
         JsonRpcRequest {
