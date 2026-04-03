@@ -72,19 +72,17 @@ impl ImsgAdapter {
     ) -> Result<SendResult, AdapterError> {
         self.ensure_binary()?;
 
-        let mut cmd = Command::new(&self.binary_path);
-        cmd.arg("send")
-            .arg("--to")
+        // Run osascript as root via a narrow sudoers rule so it bypasses TCC.
+        // The script is root-owned and read-only; arguments are passed as argv
+        // (no AppleScript injection risk). Root bypasses the Apple Events TCC
+        // check that blocks daemon-context processes from reaching Messages.app.
+        debug!(recipient, "sending imsg via osascript");
+        let output = Command::new("sudo")
+            .arg("/usr/local/carapace/imsg-send")
             .arg(recipient)
-            .arg("--text")
-            .arg(message);
-
-        for file in attachments {
-            cmd.arg("--file").arg(file);
-        }
-
-        debug!(recipient, "sending imsg");
-        let output = cmd.output().await?;
+            .arg(message)
+            .output()
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -127,8 +125,7 @@ impl ImsgAdapter {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str(stdout.trim())
-            .map_err(|e| AdapterError::OutputParse(format!("{e}: {stdout}")))
+        parse_json_lines(&stdout)
     }
 
     /// Get chat history via `imsg history --json`.
@@ -166,8 +163,7 @@ impl ImsgAdapter {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str(stdout.trim())
-            .map_err(|e| AdapterError::OutputParse(format!("{e}: {stdout}")))
+        parse_json_lines(&stdout)
     }
 
     /// Health check: verify binary exists, db exists, run a smoke test.
@@ -222,20 +218,44 @@ impl ImsgAdapter {
         }
     }
 
+    /// Query the current maximum message rowid from the Messages database.
+    /// Used to pass `--since-rowid` to `imsg watch` so replayed subscriptions
+    /// don't re-deliver already-seen messages.
+    pub async fn max_message_rowid(&self) -> Option<u64> {
+        let output = tokio::process::Command::new("sqlite3")
+            .arg(&self.db_path)
+            .arg("SELECT MAX(ROWID) FROM message")
+            .output()
+            .await
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+
     /// Start watching for incoming messages via `imsg watch --json`.
     ///
     /// Spawns the child process and a tokio task that reads JSON lines from
     /// stdout into an mpsc channel. Returns a `WatchHandle` (which kills the
     /// child on drop) and a receiver of parsed JSON events.
+    ///
+    /// Pass `since_rowid` to skip messages already seen before this watch
+    /// session started — prevents re-delivery when subscriptions restart.
     pub fn watch(
         &self,
         buffer_size: usize,
+        since_rowid: Option<u64>,
     ) -> Result<(WatchHandle, mpsc::Receiver<serde_json::Value>), AdapterError> {
         self.ensure_binary()?;
 
-        let mut child = tokio::process::Command::new(&self.binary_path)
-            .arg("watch")
-            .arg("--json")
+        let mut cmd = tokio::process::Command::new(&self.binary_path);
+        cmd.arg("watch").arg("--json");
+        if let Some(rowid) = since_rowid {
+            cmd.arg("--since-rowid").arg(rowid.to_string());
+        }
+
+        let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -293,6 +313,33 @@ impl Drop for WatchHandle {
         // kill_on_drop is set, but we also abort the reader task
         let _ = self.child.start_kill();
         self._reader_task.abort();
+    }
+}
+
+/// Parse JSON Lines output (one JSON object per line) into a JSON array.
+fn parse_json_lines(output: &str) -> Result<serde_json::Value, AdapterError> {
+    let items: Result<Vec<serde_json::Value>, _> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l))
+        .collect();
+
+    match items {
+        Ok(arr) => Ok(serde_json::Value::Array(arr)),
+        Err(e) => Err(AdapterError::OutputParse(format!("{e}: {output}"))),
+    }
+}
+
+/// Encode a Rust string as an AppleScript string literal, safely handling
+/// embedded double-quotes by concatenating with AppleScript's `quote` constant.
+fn applescript_string(s: &str) -> String {
+    let parts: Vec<&str> = s.split('"').collect();
+    if parts.len() == 1 {
+        format!("\"{}\"", s)
+    } else {
+        let inner = parts.join("\" & quote & \"");
+        format!("\"{}\"", inner)
     }
 }
 

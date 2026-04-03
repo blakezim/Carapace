@@ -37,8 +37,7 @@ db_path = "/Users/carapace/Library/Messages/chat.db"
 [channels.imsg.outbound]
 mode = "allowlist"
 allowlist = [
-    "+1234567890",
-    "friend@icloud.com",
+    "+19703161639",
 ]
 
 [channels.imsg.inbound]

@@ -29,6 +29,9 @@ pub struct AppState {
     pub imsg_adapter: Option<ImsgAdapter>,
     pub imsg_outbound: Option<Allowlist>,
     pub imsg_inbound: Option<Allowlist>,
+    /// Message IDs already forwarded to a watch subscriber. Persists across
+    /// reconnections so re-subscriptions never re-deliver seen messages.
+    pub seen_message_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl AppState {
@@ -78,6 +81,7 @@ impl AppState {
             imsg_adapter,
             imsg_outbound,
             imsg_inbound,
+            seen_message_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -103,14 +107,25 @@ pub async fn run(socket_path: &Path, config: Config) -> std::io::Result<()> {
     let listener = UnixListener::bind(socket_path)?;
     info!(?socket_path, "daemon listening");
 
-    // Set socket permissions: owner + group can read/write (0o770).
-    // This allows the carapace user and carapace-clients group to connect.
+    // Set socket ownership to carapace:carapace-clients and permissions to 0770.
+    // This allows the carapace user and carapace-clients group members to connect.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o770);
         std::fs::set_permissions(socket_path, perms)?;
-        info!("socket permissions set to 0770");
+
+        // Set group to carapace-clients so cross-user connections work.
+        if let Some(group) = nix::unistd::Group::from_name("carapace-clients")
+            .ok()
+            .flatten()
+        {
+            nix::unistd::chown(socket_path, None, Some(group.gid))?;
+            info!(group = "carapace-clients", "socket permissions set to 0770");
+        } else {
+            warn!("carapace-clients group not found — socket may not be accessible to clients");
+            info!("socket permissions set to 0770");
+        }
     }
 
     let state = Arc::new(AppState::new(&config));
@@ -292,6 +307,7 @@ async fn process_message(raw: &str, state: &AppState) -> ProcessResult {
             imsg_inbound: state.imsg_inbound.as_ref(),
             audit_logger: &state.audit_logger,
             dead_letter_queue: &state.dead_letter_queue,
+            seen_message_ids: Arc::clone(&state.seen_message_ids),
         };
         channel_handler::handle_channel_request(&req, &ctx).await
     } else {

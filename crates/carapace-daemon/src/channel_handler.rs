@@ -7,6 +7,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::adapters::imsg::ImsgAdapter;
 use crate::allowlist::{Allowlist, AllowlistResult};
 use crate::audit::{self, AuditLogger};
@@ -20,6 +23,9 @@ pub struct ChannelContext<'a> {
     pub imsg_inbound: Option<&'a Allowlist>,
     pub audit_logger: &'a AuditLogger,
     pub dead_letter_queue: &'a DeadLetterQueue,
+    /// Shared across all watch subscriptions — prevents re-delivering messages
+    /// already seen in a previous subscription session.
+    pub seen_message_ids: Arc<tokio::sync::Mutex<HashSet<u64>>>,
 }
 
 /// Handle a `channel.*` JSON-RPC request.
@@ -295,7 +301,8 @@ async fn handle_watch(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Process
         }
     };
 
-    let (watch_handle, mut adapter_rx) = match adapter.watch(128) {
+    let since_rowid = adapter.max_message_rowid().await;
+    let (watch_handle, mut adapter_rx) = match adapter.watch(128, since_rowid) {
         Ok(pair) => pair,
         Err(e) => {
             warn!(error = %e, "imsg watch failed to start");
@@ -308,14 +315,25 @@ async fn handle_watch(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Process
     };
 
     let inbound = ctx.imsg_inbound.cloned();
+    let seen = Arc::clone(&ctx.seen_message_ids);
     let (tx, rx) = mpsc::channel::<JsonRpcNotification>(128);
 
     // Spawn a filtering task that reads from the adapter and applies
-    // the inbound allowlist before forwarding notifications.
+    // the inbound allowlist and deduplication before forwarding notifications.
     tokio::spawn(async move {
         let _handle = watch_handle; // move ownership so child lives until task ends
 
         while let Some(event) = adapter_rx.recv().await {
+            // Deduplicate by message ID — skip any message already forwarded
+            // in this or a previous subscription session.
+            if let Some(id) = event.get("id").and_then(|v| v.as_u64()) {
+                let mut seen_guard = seen.lock().await;
+                if seen_guard.contains(&id) {
+                    continue; // already delivered
+                }
+                seen_guard.insert(id);
+            }
+
             // Check inbound allowlist if configured.
             if let Some(ref al) = inbound {
                 let sender = event
@@ -381,6 +399,10 @@ mod tests {
         }
     }
 
+    fn noop_seen() -> Arc<tokio::sync::Mutex<HashSet<u64>>> {
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()))
+    }
+
     #[tokio::test]
     async fn send_missing_recipient_rejected() {
         let audit = noop_audit();
@@ -391,6 +413,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req("channel.send", json!({"message": "hello"}));
@@ -408,6 +431,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req("channel.send", json!({"recipient": "+1234567890"}));
@@ -425,6 +449,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req(
@@ -453,6 +478,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req(
@@ -473,6 +499,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req(
@@ -493,6 +520,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req("channel.unknown", json!({}));
@@ -510,6 +538,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req("channel.get_history", json!({}));
@@ -527,6 +556,7 @@ mod tests {
             imsg_inbound: None,
             audit_logger: &audit,
             dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
         };
 
         let req = make_req("channel.status", json!({}));

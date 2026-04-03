@@ -206,44 +206,61 @@ create_carapace_user() {
 
     prompt_continue
 
-    # Install imsg into the carapace user's private bin directory.
-    # Homebrew is owned by the main user, so we install there first
-    # then copy the binary to a location only carapace can access.
+    # Install imsg (real binary) into the carapace user's private bin.
+    #
+    # IMPORTANT: We download the universal binary directly from GitHub releases
+    # rather than using Homebrew. The Homebrew formula installs the real binary
+    # into libexec/ and places a *wrapper script* at $(which imsg). Copying
+    # that wrapper gives you a shell script that can't find the binary.
+    # The zip also contains resource bundles (PhoneNumberKit, SQLite) that must
+    # sit alongside the binary or imsg will crash on launch.
     info "Setting up imsg for the carapace user..."
 
-    local imsg_target="/Users/$CARAPACE_USER/.local/bin/imsg"
+    local imsg_bin_dir="/Users/$CARAPACE_USER/.local/bin"
+    local imsg_target="$imsg_bin_dir/imsg"
 
-    if sudo -u "$CARAPACE_USER" test -f "$imsg_target" 2>/dev/null; then
+    if sudo -u "$CARAPACE_USER" test -f "$imsg_target" 2>/dev/null && \
+       sudo file "$imsg_target" 2>/dev/null | grep -q "Mach-O"; then
         success "imsg already installed at $imsg_target"
     else
-        # Make sure imsg is available via Homebrew on the main account
-        if ! check_cmd imsg; then
-            info "Installing imsg via Homebrew (on your account, to grab the binary)..."
-            brew install steipete/tap/imsg
-        fi
+        local imsg_version="v0.5.0"
+        local download_url="https://github.com/steipete/imsg/releases/download/${imsg_version}/imsg-macos.zip"
+        local tmp_dir
+        tmp_dir="$(mktemp -d)"
 
-        local imsg_src
-        imsg_src="$(which imsg 2>/dev/null || echo "$(brew --prefix 2>/dev/null || echo /usr/local)/bin/imsg")"
+        info "Downloading imsg ${imsg_version} from GitHub releases..."
+        if ! curl -fsSL -o "${tmp_dir}/imsg-macos.zip" "$download_url"; then
+            fail "Failed to download imsg from $download_url"
+            rm -rf "$tmp_dir"
+            warn "Install manually: download from https://github.com/steipete/imsg/releases"
+            warn "Extract and copy the binary + *.bundle dirs to $imsg_bin_dir"
+            echo ""
+        else
+            info "Extracting..."
+            unzip -q "${tmp_dir}/imsg-macos.zip" -d "${tmp_dir}/imsg"
 
-        if [[ -f "$imsg_src" ]]; then
-            info "Copying imsg to $imsg_target (carapace-only access)..."
-            sudo mkdir -p "/Users/$CARAPACE_USER/.local/bin"
-            sudo cp "$imsg_src" "$imsg_target"
+            sudo mkdir -p "$imsg_bin_dir"
+
+            # Install the binary
+            sudo cp "${tmp_dir}/imsg/imsg" "$imsg_target"
             sudo chown "$CARAPACE_USER" "$imsg_target"
             sudo chmod 700 "$imsg_target"
-            success "imsg installed at $imsg_target (owned by carapace, mode 700)"
 
-            if prompt_yn "Remove imsg from your main account? (recommended for isolation)" "y"; then
-                brew uninstall imsg 2>/dev/null || true
-                success "imsg removed from main account"
-            fi
-        else
-            warn "Could not find imsg binary. Install it manually:"
-            warn "  brew install steipete/tap/imsg"
-            warn "  sudo cp \$(which imsg) $imsg_target"
-            warn "  sudo chown carapace $imsg_target"
-            warn "  sudo chmod 700 $imsg_target"
-            echo ""
+            # Install resource bundles (PhoneNumberKit, SQLite, etc.)
+            # These must be alongside the binary or imsg will crash on launch.
+            local bundle_count=0
+            for bundle in "${tmp_dir}"/imsg/*.bundle; do
+                if [[ -d "$bundle" ]]; then
+                    local bundle_name
+                    bundle_name="$(basename "$bundle")"
+                    sudo cp -R "$bundle" "${imsg_bin_dir}/${bundle_name}"
+                    sudo chown -R "$CARAPACE_USER" "${imsg_bin_dir}/${bundle_name}"
+                    ((bundle_count++))
+                fi
+            done
+
+            rm -rf "$tmp_dir"
+            success "imsg ${imsg_version} installed at $imsg_target (with ${bundle_count} resource bundles)"
         fi
     fi
 }
