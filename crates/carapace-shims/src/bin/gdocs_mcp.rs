@@ -391,8 +391,7 @@ fn call_tool(
             let gw_params = with_account(
                 json!({
                     "channel": "gdocs",
-                    "action": "read",
-                    "document_id": doc_id,
+                    "chat_id": doc_id,
                 }),
                 gdocs_account,
             );
