@@ -48,15 +48,79 @@ pub struct ChannelsConfig {
 }
 
 /// Configuration for the Gmail channel.
+///
+/// Supports two formats:
+/// - **Legacy single-account:** `proxy_socket` field (backward-compatible)
+/// - **Multi-account:** `accounts` table with named accounts
+///
+/// When the legacy format is used, the daemon treats it as a single account
+/// named "default". Old configs and MCP clients that don't pass an `account`
+/// parameter continue to work unchanged.
 #[derive(Debug, Deserialize)]
 pub struct GmailChannelConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Path to the gmail-proxy Unix socket.
-    #[serde(default = "default_gmail_socket")]
+
+    /// Legacy single-account field. If `accounts` is also present, this is ignored.
+    #[serde(default)]
+    pub proxy_socket: Option<PathBuf>,
+
+    /// Named accounts, each with its own proxy socket and inbound config.
+    #[serde(default)]
+    pub accounts: Option<HashMap<String, GmailAccountConfig>>,
+
+    /// Which account to use when no `account` param is specified in a request.
+    /// Defaults to "default" (legacy) or the first account in the map.
+    pub default_account: Option<String>,
+
+    /// Legacy inbound config (used when `proxy_socket` is set without `accounts`).
+    #[serde(default)]
+    pub inbound: DirectionConfig,
+}
+
+/// Configuration for a single Gmail account within the multi-account setup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmailAccountConfig {
     pub proxy_socket: PathBuf,
     #[serde(default)]
     pub inbound: DirectionConfig,
+}
+
+impl GmailChannelConfig {
+    /// Resolve to a map of account_name → GmailAccountConfig.
+    ///
+    /// Handles both legacy (single `proxy_socket`) and new (`accounts` map) formats.
+    pub fn resolve_accounts(&self) -> HashMap<String, GmailAccountConfig> {
+        if let Some(ref accounts) = self.accounts {
+            accounts.clone()
+        } else if let Some(ref socket) = self.proxy_socket {
+            let mut map = HashMap::new();
+            map.insert(
+                "default".to_string(),
+                GmailAccountConfig {
+                    proxy_socket: socket.clone(),
+                    inbound: self.inbound.clone(),
+                },
+            );
+            map
+        } else {
+            // No proxy_socket and no accounts — use the default socket path.
+            let mut map = HashMap::new();
+            map.insert(
+                "default".to_string(),
+                GmailAccountConfig {
+                    proxy_socket: default_gmail_socket(),
+                    inbound: self.inbound.clone(),
+                },
+            );
+            map
+        }
+    }
+
+    /// Get the default account name for requests that don't specify one.
+    pub fn default_account_name(&self) -> &str {
+        self.default_account.as_deref().unwrap_or("default")
+    }
 }
 
 fn default_gmail_socket() -> PathBuf {
@@ -79,7 +143,7 @@ pub struct ImsgChannelConfig {
 }
 
 /// Per-direction allowlist/denylist configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DirectionConfig {
     #[serde(default)]
     pub mode: AllowlistMode,
@@ -412,9 +476,58 @@ mode = "open"
         assert!(gmail.enabled);
         assert_eq!(
             gmail.proxy_socket,
-            PathBuf::from("/var/run/carapace/gmail-proxy.sock")
+            Some(PathBuf::from("/var/run/carapace/gmail-proxy.sock"))
         );
         assert_eq!(gmail.inbound.mode, AllowlistMode::Open);
+
+        // Legacy format should resolve to one "default" account.
+        let accounts = gmail.resolve_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts.contains_key("default"));
+        assert_eq!(
+            accounts["default"].proxy_socket,
+            PathBuf::from("/var/run/carapace/gmail-proxy.sock")
+        );
+    }
+
+    #[test]
+    fn parse_gmail_multi_account_config() {
+        let toml_str = r#"
+[channels.gmail]
+enabled = true
+default_account = "primary"
+
+[channels.gmail.accounts.primary]
+proxy_socket = "/var/run/carapace/gmail-proxy-primary.sock"
+
+[channels.gmail.accounts.primary.inbound]
+mode = "open"
+
+[channels.gmail.accounts.wedding]
+proxy_socket = "/var/run/carapace/gmail-proxy-wedding.sock"
+
+[channels.gmail.accounts.wedding.inbound]
+mode = "allowlist"
+allowlist = ["vendor@example.com"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let gmail = config.channels.gmail.unwrap();
+        assert!(gmail.enabled);
+        assert_eq!(gmail.default_account_name(), "primary");
+
+        let accounts = gmail.resolve_accounts();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            accounts["primary"].proxy_socket,
+            PathBuf::from("/var/run/carapace/gmail-proxy-primary.sock")
+        );
+        assert_eq!(accounts["primary"].inbound.mode, AllowlistMode::Open);
+        assert_eq!(
+            accounts["wedding"].proxy_socket,
+            PathBuf::from("/var/run/carapace/gmail-proxy-wedding.sock")
+        );
+        assert_eq!(accounts["wedding"].inbound.mode, AllowlistMode::Allowlist);
+        assert_eq!(accounts["wedding"].inbound.allowlist.len(), 1);
     }
 
     #[test]

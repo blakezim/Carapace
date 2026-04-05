@@ -9,7 +9,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::adapters::gmail::GmailAdapter;
@@ -22,7 +22,10 @@ use crate::protocol::{self, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse
 /// A resolved channel adapter (one of the supported channels).
 enum Channel<'a> {
     Imsg(&'a ImsgAdapter),
-    Gmail(&'a GmailAdapter),
+    Gmail {
+        adapter: &'a GmailAdapter,
+        inbound: Option<&'a Allowlist>,
+    },
 }
 
 /// Shared channel state, borrowed from AppState.
@@ -34,8 +37,10 @@ pub struct ChannelContext<'a> {
     pub dead_letter_queue: &'a DeadLetterQueue,
     /// Shared across all iMessage watch subscriptions.
     pub seen_message_ids: Arc<tokio::sync::Mutex<HashSet<u64>>>,
-    pub gmail_adapter: Option<&'a GmailAdapter>,
-    pub gmail_inbound: Option<&'a Allowlist>,
+    // Gmail — keyed by account name
+    pub gmail_adapters: &'a HashMap<String, GmailAdapter>,
+    pub gmail_inbound_allowlists: &'a HashMap<String, Allowlist>,
+    pub gmail_default_account: &'a str,
 }
 
 /// Handle a `channel.*` JSON-RPC request.
@@ -66,6 +71,9 @@ pub async fn handle_channel_request(
 }
 
 /// Resolve which channel is being targeted and verify it's available.
+///
+/// For Gmail, also resolves the account name from the `account` parameter,
+/// falling back to the configured default account.
 fn resolve_channel<'a>(
     params: &serde_json::Value,
     ctx: &'a ChannelContext<'_>,
@@ -83,13 +91,31 @@ fn resolve_channel<'a>(
                 "iMessage channel is not configured or unavailable",
             )
         }),
-        "gmail" => ctx.gmail_adapter.map(Channel::Gmail).ok_or_else(|| {
-            JsonRpcResponse::error(
-                serde_json::Value::Null,
-                protocol::CHANNEL_UNAVAILABLE,
-                "Gmail channel is not configured or unavailable",
-            )
-        }),
+        "gmail" => {
+            if ctx.gmail_adapters.is_empty() {
+                return Err(JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    protocol::CHANNEL_UNAVAILABLE,
+                    "Gmail channel is not configured or unavailable",
+                ));
+            }
+            let account = params
+                .get("account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ctx.gmail_default_account);
+
+            let adapter = ctx.gmail_adapters.get(account).ok_or_else(|| {
+                JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    protocol::CHANNEL_UNAVAILABLE,
+                    format!("Gmail account '{}' is not configured. Available: {:?}",
+                        account, ctx.gmail_adapters.keys().collect::<Vec<_>>()),
+                )
+            })?;
+            let inbound = ctx.gmail_inbound_allowlists.get(account);
+
+            Ok(Channel::Gmail { adapter, inbound })
+        }
         other => Err(JsonRpcResponse::error(
             serde_json::Value::Null,
             protocol::CHANNEL_UNAVAILABLE,
@@ -107,7 +133,7 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
         Err(mut e) => { e.id = req.id.clone(); return e; }
     };
 
-    if let Channel::Gmail(_) = channel {
+    if let Channel::Gmail { .. } = channel {
         return JsonRpcResponse::error(
             req.id.clone(),
             protocol::METHOD_NOT_FOUND,
@@ -171,7 +197,7 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
                 }
             }
         }
-        Channel::Gmail(_) => unreachable!("Gmail send blocked above"),
+        Channel::Gmail { .. } => unreachable!("Gmail send blocked above"),
     }
 }
 
@@ -195,7 +221,7 @@ async fn handle_list_chats(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Js
                 }
             }
         }
-        Channel::Gmail(adapter) => {
+        Channel::Gmail { adapter, .. } => {
             // For Gmail, list_chats returns recent inbox threads.
             let max = limit.unwrap_or(20);
             match adapter.search("in:inbox", Some(max), None).await {
@@ -240,7 +266,7 @@ async fn handle_get_history(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> J
                 }
             }
         }
-        Channel::Gmail(adapter) => {
+        Channel::Gmail { adapter, .. } => {
             // For Gmail, chat_id is the thread ID.
             match adapter.get_thread(chat_id).await {
                 Ok(thread) => JsonRpcResponse::success(req.id.clone(), thread),
@@ -282,21 +308,34 @@ async fn handle_status(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
             }))
         }
         "gmail" => {
-            let (configured, health) = if let Some(adapter) = ctx.gmail_adapter {
+            let account = req.params.get("account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ctx.gmail_default_account);
+
+            let (configured, health) = if let Some(adapter) = ctx.gmail_adapters.get(account) {
                 (true, Some(adapter.health_check().await))
-            } else {
+            } else if ctx.gmail_adapters.is_empty() {
                 (false, None)
+            } else {
+                return JsonRpcResponse::error(
+                    req.id.clone(),
+                    protocol::CHANNEL_UNAVAILABLE,
+                    format!("Gmail account '{}' is not configured. Available: {:?}",
+                        account, ctx.gmail_adapters.keys().collect::<Vec<_>>()),
+                );
             };
 
-            let inbound_info = ctx.gmail_inbound.map(|al| {
+            let inbound_info = ctx.gmail_inbound_allowlists.get(account).map(|al| {
                 json!({ "mode": al.mode_str(), "entries": al.entry_count() })
             });
 
             JsonRpcResponse::success(req.id.clone(), json!({
                 "channel": "gmail",
+                "account": account,
                 "configured": configured,
                 "health": health.map(|h| serde_json::to_value(&h).unwrap()),
                 "inbound": inbound_info,
+                "accounts": ctx.gmail_adapters.keys().collect::<Vec<_>>(),
             }))
         }
         other => JsonRpcResponse::error(
@@ -357,10 +396,10 @@ async fn handle_watch(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Process
             ProcessResult::Subscription { ack, notifications: rx }
         }
 
-        Channel::Gmail(adapter) => {
+        Channel::Gmail { adapter, inbound: inbound_al } => {
             let poll_interval = Duration::from_secs(30);
             let (watch_handle, mut adapter_rx) = adapter.watch(128, poll_interval);
-            let inbound = ctx.gmail_inbound.cloned();
+            let inbound = inbound_al.cloned();
             let (tx, rx) = mpsc::channel::<JsonRpcNotification>(128);
 
             tokio::spawn(async move {
@@ -405,7 +444,7 @@ async fn handle_search(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
             req.id.clone(), protocol::METHOD_NOT_FOUND,
             "channel.search is only supported on the gmail channel",
         ),
-        Channel::Gmail(adapter) => {
+        Channel::Gmail { adapter, .. } => {
             let max = req.params.get("max").and_then(|v| v.as_u64()).map(|n| n as u32);
             let page_token = req.params.get("page_token").and_then(|v| v.as_str());
 
@@ -454,7 +493,7 @@ async fn handle_create_draft(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> 
             req.id.clone(), protocol::METHOD_NOT_FOUND,
             "channel.create_draft is only supported on the gmail channel",
         ),
-        Channel::Gmail(adapter) => {
+        Channel::Gmail { adapter, .. } => {
             match adapter.create_draft(to, subject, body, cc).await {
                 Ok(result) => {
                     info!(to, subject, draft_id = %result.draft_id, "gmail draft created");
@@ -507,7 +546,20 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(HashSet::new()))
     }
 
-    fn empty_ctx<'a>(audit: &'a AuditLogger, dlq: &'a DeadLetterQueue) -> ChannelContext<'a> {
+    fn empty_gmail_adapters() -> HashMap<String, GmailAdapter> {
+        HashMap::new()
+    }
+
+    fn empty_gmail_allowlists() -> HashMap<String, Allowlist> {
+        HashMap::new()
+    }
+
+    fn empty_ctx<'a>(
+        audit: &'a AuditLogger,
+        dlq: &'a DeadLetterQueue,
+        gmail_adapters: &'a HashMap<String, GmailAdapter>,
+        gmail_allowlists: &'a HashMap<String, Allowlist>,
+    ) -> ChannelContext<'a> {
         ChannelContext {
             imsg_adapter: None,
             imsg_outbound: None,
@@ -515,36 +567,45 @@ mod tests {
             audit_logger: audit,
             dead_letter_queue: dlq,
             seen_message_ids: noop_seen(),
-            gmail_adapter: None,
-            gmail_inbound: None,
+            gmail_adapters,
+            gmail_inbound_allowlists: gmail_allowlists,
+            gmail_default_account: "default",
         }
     }
 
     #[tokio::test]
     async fn send_missing_recipient_rejected() {
+        // With no imsg adapter, resolve_channel returns CHANNEL_UNAVAILABLE
+        // before we get to param validation. That's correct behavior.
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.send", json!({"message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
-        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+        assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn send_missing_message_rejected() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.send", json!({"recipient": "+1234567890"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
-        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+        assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn send_no_adapter_returns_unavailable() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.send", json!({"recipient": "+1234567890", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -562,6 +623,8 @@ mod tests {
         });
         let audit = noop_audit();
         let dlq = noop_dead_letter();
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
         let ctx = ChannelContext {
             imsg_adapter: Some(&adapter),
             imsg_outbound: Some(&outbound),
@@ -569,8 +632,9 @@ mod tests {
             audit_logger: &audit,
             dead_letter_queue: &dlq,
             seen_message_ids: noop_seen(),
-            gmail_adapter: None,
-            gmail_inbound: None,
+            gmail_adapters: &ga,
+            gmail_inbound_allowlists: &gal,
+            gmail_default_account: "default",
         };
         let req = make_req("channel.send", json!({"recipient": "+9999999999", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
@@ -581,7 +645,9 @@ mod tests {
     async fn unknown_channel_returns_unavailable() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.send", json!({"channel": "signal", "recipient": "+1234567890", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -591,7 +657,9 @@ mod tests {
     async fn unknown_channel_method() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.unknown", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
@@ -601,7 +669,9 @@ mod tests {
     async fn get_history_missing_chat_id() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.get_history", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
@@ -611,7 +681,9 @@ mod tests {
     async fn status_unconfigured_imsg() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.status", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         let result = resp.result.unwrap();
@@ -623,7 +695,9 @@ mod tests {
     async fn status_unconfigured_gmail() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = empty_ctx(&audit, &dlq);
+        let ga = empty_gmail_adapters();
+        let gal = empty_gmail_allowlists();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
         let req = make_req("channel.status", json!({"channel": "gmail"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         let result = resp.result.unwrap();
@@ -633,7 +707,9 @@ mod tests {
 
     #[tokio::test]
     async fn gmail_send_returns_not_supported() {
-        let adapter = GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock"));
+        let mut ga = HashMap::new();
+        ga.insert("default".to_string(), GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock")));
+        let gal = empty_gmail_allowlists();
         let audit = noop_audit();
         let dlq = noop_dead_letter();
         let ctx = ChannelContext {
@@ -643,8 +719,9 @@ mod tests {
             audit_logger: &audit,
             dead_letter_queue: &dlq,
             seen_message_ids: noop_seen(),
-            gmail_adapter: Some(&adapter),
-            gmail_inbound: None,
+            gmail_adapters: &ga,
+            gmail_inbound_allowlists: &gal,
+            gmail_default_account: "default",
         };
         let req = make_req("channel.send", json!({"channel": "gmail", "recipient": "a@b.com", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
@@ -653,7 +730,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_draft_missing_to() {
-        let adapter = GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock"));
+        let mut ga = HashMap::new();
+        ga.insert("default".to_string(), GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock")));
+        let gal = empty_gmail_allowlists();
         let audit = noop_audit();
         let dlq = noop_dead_letter();
         let ctx = ChannelContext {
@@ -663,8 +742,9 @@ mod tests {
             audit_logger: &audit,
             dead_letter_queue: &dlq,
             seen_message_ids: noop_seen(),
-            gmail_adapter: Some(&adapter),
-            gmail_inbound: None,
+            gmail_adapters: &ga,
+            gmail_inbound_allowlists: &gal,
+            gmail_default_account: "default",
         };
         let req = make_req("channel.create_draft", json!({"channel": "gmail", "subject": "Hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);

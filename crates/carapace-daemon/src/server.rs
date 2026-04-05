@@ -8,6 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
+use std::collections::HashMap;
+
 use crate::adapters::gmail::GmailAdapter;
 use crate::adapters::imsg::ImsgAdapter;
 use crate::allowlist::Allowlist;
@@ -33,9 +35,10 @@ pub struct AppState {
     pub imsg_inbound: Option<Allowlist>,
     /// iMessage IDs already forwarded to a watch subscriber.
     pub seen_message_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
-    // Gmail channel
-    pub gmail_adapter: Option<GmailAdapter>,
-    pub gmail_inbound: Option<Allowlist>,
+    // Gmail channel — keyed by account name (e.g. "default", "primary", "wedding")
+    pub gmail_adapters: HashMap<String, GmailAdapter>,
+    pub gmail_inbound_allowlists: HashMap<String, Allowlist>,
+    pub gmail_default_account: String,
 }
 
 impl AppState {
@@ -74,25 +77,27 @@ impl AppState {
                 (None, None, None)
             };
 
-        // Build Gmail adapter if configured.
-        let (gmail_adapter, gmail_inbound) =
-            if let Some(ref gmail_config) = config.channels.gmail {
-                if !gmail_config.enabled {
-                    tracing::info!("gmail channel is disabled in config");
-                    (None, None)
-                } else {
-                    tracing::info!(
-                        socket = %gmail_config.proxy_socket.display(),
-                        "gmail channel enabled"
-                    );
-                    (
-                        Some(GmailAdapter::new(gmail_config.proxy_socket.clone())),
-                        Some(Allowlist::new(&gmail_config.inbound)),
-                    )
-                }
+        // Build Gmail adapters — one per configured account.
+        let mut gmail_adapters = HashMap::new();
+        let mut gmail_inbound_allowlists = HashMap::new();
+        let mut gmail_default_account = "default".to_string();
+
+        if let Some(ref gmail_config) = config.channels.gmail {
+            if !gmail_config.enabled {
+                tracing::info!("gmail channel is disabled in config");
             } else {
-                (None, None)
-            };
+                gmail_default_account = gmail_config.default_account_name().to_string();
+                for (name, account) in gmail_config.resolve_accounts() {
+                    tracing::info!(
+                        account = %name,
+                        socket = %account.proxy_socket.display(),
+                        "gmail account enabled"
+                    );
+                    gmail_adapters.insert(name.clone(), GmailAdapter::new(account.proxy_socket.clone()));
+                    gmail_inbound_allowlists.insert(name.clone(), Allowlist::new(&account.inbound));
+                }
+            }
+        }
 
         Self {
             rate_limiter: RateLimiter::new(config.security.rate_limit.clone()),
@@ -106,8 +111,9 @@ impl AppState {
             imsg_outbound,
             imsg_inbound,
             seen_message_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-            gmail_adapter,
-            gmail_inbound,
+            gmail_adapters,
+            gmail_inbound_allowlists,
+            gmail_default_account,
         }
     }
 }
@@ -334,8 +340,9 @@ async fn process_message(raw: &str, state: &AppState) -> ProcessResult {
             audit_logger: &state.audit_logger,
             dead_letter_queue: &state.dead_letter_queue,
             seen_message_ids: Arc::clone(&state.seen_message_ids),
-            gmail_adapter: state.gmail_adapter.as_ref(),
-            gmail_inbound: state.gmail_inbound.as_ref(),
+            gmail_adapters: &state.gmail_adapters,
+            gmail_inbound_allowlists: &state.gmail_inbound_allowlists,
+            gmail_default_account: &state.gmail_default_account,
         };
         channel_handler::handle_channel_request(&req, &ctx).await
     } else {

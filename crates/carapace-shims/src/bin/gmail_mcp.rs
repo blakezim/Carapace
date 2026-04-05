@@ -57,6 +57,12 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() {
     eprintln!("[gmail-mcp] starting — waiting for MCP messages on stdin");
 
+    // Optional: target a specific Gmail account in the daemon's multi-account config.
+    let gmail_account: Option<String> = std::env::var("GMAIL_ACCOUNT").ok();
+    if let Some(ref acct) = gmail_account {
+        eprintln!("[gmail-mcp] targeting account: {acct}");
+    }
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -95,7 +101,7 @@ fn main() {
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(json!({}));
 
-        let response = handle_message(method, &params, id.clone(), &mut client);
+        let response = handle_message(method, &params, id.clone(), &mut client, &gmail_account);
         // Notifications return Null — nothing to write back.
         if response.is_null() {
             continue;
@@ -110,7 +116,7 @@ fn main() {
 
 // ── MCP message dispatcher ───────────────────────────────────────────────────
 
-fn handle_message(method: &str, params: &Value, id: Value, client: &mut Option<GatewayClient>) -> Value {
+fn handle_message(method: &str, params: &Value, id: Value, client: &mut Option<GatewayClient>, gmail_account: &Option<String>) -> Value {
     match method {
         // ── MCP handshake ────────────────────────────────────────────────────
         "initialize" => {
@@ -169,7 +175,7 @@ fn handle_message(method: &str, params: &Value, id: Value, client: &mut Option<G
             }
 
             let gw = client.as_mut().unwrap();
-            call_tool(tool_name, &args, id, gw)
+            call_tool(tool_name, &args, id, gw, gmail_account)
         }
 
         // ── Unknown method ───────────────────────────────────────────────────
@@ -283,7 +289,15 @@ Use this to diagnose connection problems before calling other Gmail tools.",
 
 // ── Tool call dispatcher ─────────────────────────────────────────────────────
 
-fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient) -> Value {
+/// Inject the `account` field into a gateway params object if an account is configured.
+fn with_account(mut params: Value, gmail_account: &Option<String>) -> Value {
+    if let Some(ref acct) = gmail_account {
+        params["account"] = json!(acct);
+    }
+    params
+}
+
+fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient, gmail_account: &Option<String>) -> Value {
     match name {
         "gmail_search" => {
             let query = match args.get("query").and_then(|v| v.as_str()) {
@@ -292,11 +306,11 @@ fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient) -> Val
             };
             let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(20);
 
-            let gw_params = json!({
+            let gw_params = with_account(json!({
                 "channel": "gmail",
                 "query": query,
                 "max": max,
-            });
+            }), gmail_account);
 
             match gw.call("channel.search", gw_params) {
                 Ok(result) => tool_success(id, result),
@@ -310,10 +324,10 @@ fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient) -> Val
                 None => return tool_error(id, "Missing required argument: \"thread_id\""),
             };
 
-            let gw_params = json!({
+            let gw_params = with_account(json!({
                 "channel": "gmail",
                 "chat_id": thread_id,
-            });
+            }), gmail_account);
 
             match gw.call("channel.get_history", gw_params) {
                 Ok(result) => tool_success(id, result),
@@ -335,12 +349,12 @@ fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient) -> Val
                 None => return tool_error(id, "Missing required argument: \"body\""),
             };
 
-            let mut gw_params = json!({
+            let mut gw_params = with_account(json!({
                 "channel": "gmail",
                 "to": to,
                 "subject": subject,
                 "body": body,
-            });
+            }), gmail_account);
             if let Some(cc) = args.get("cc").and_then(|v| v.as_str()) {
                 gw_params["cc"] = json!(cc);
             }
@@ -352,7 +366,8 @@ fn call_tool(name: &str, args: &Value, id: Value, gw: &mut GatewayClient) -> Val
         }
 
         "gmail_status" => {
-            match gw.call("channel.status", json!({"channel": "gmail"})) {
+            let gw_params = with_account(json!({"channel": "gmail"}), gmail_account);
+            match gw.call("channel.status", gw_params) {
                 Ok(result) => tool_success(id, result),
                 Err(e) => tool_error(id, format!("gmail_status failed: {e}")),
             }
