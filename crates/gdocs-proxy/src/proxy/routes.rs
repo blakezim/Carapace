@@ -53,6 +53,9 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/docs", axum::routing::post(create_doc_handler))
         .route("/docs/copy/{id}", axum::routing::post(copy_handler))
         .route("/folders", axum::routing::post(create_folder_handler))
+        .route("/sheets", axum::routing::post(create_sheet_handler))
+        .route("/sheets/{id}/values", axum::routing::put(update_sheet_values_handler))
+        .route("/forms", axum::routing::post(create_form_handler))
         .route("/health", axum::routing::get(health_handler))
         .with_state(state)
 }
@@ -261,6 +264,158 @@ async fn create_folder_handler(
         "name": folder.name,
         "mime_type": folder.mime_type,
         "web_view_link": folder.web_view_link
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /sheets
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateSheetRequest {
+    pub name: String,
+    pub folder_id: Option<String>,
+    /// Optional initial data: array of rows, each row is array of cell values.
+    pub data: Option<Vec<Vec<String>>>,
+}
+
+async fn create_sheet_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateSheetRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if req.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: 'name'"})),
+        ));
+    }
+
+    let file = state
+        .docs
+        .create_spreadsheet(&req.name, req.folder_id.as_deref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create spreadsheet: {e}")})),
+            )
+        })?;
+
+    // If initial data was provided, write it.
+    if let Some(ref data) = req.data {
+        if !data.is_empty() {
+            let range = format!("Sheet1!A1:{}{}", col_letter(data[0].len()), data.len());
+            state
+                .docs
+                .update_sheet_values(&file.id, &range, data)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Spreadsheet created but failed to add data: {e}")})),
+                    )
+                })?;
+        }
+    }
+
+    tracing::info!(sheet_id = %file.id, name = %file.name, "spreadsheet created");
+
+    Ok(Json(serde_json::json!({
+        "id": file.id,
+        "name": file.name,
+        "mime_type": file.mime_type,
+        "web_view_link": file.web_view_link
+    })))
+}
+
+/// Convert a 1-based column number to a letter (1=A, 2=B, ..., 26=Z, 27=AA).
+fn col_letter(n: usize) -> String {
+    if n == 0 { return "A".to_string(); }
+    let mut result = String::new();
+    let mut n = n;
+    while n > 0 {
+        n -= 1;
+        result.insert(0, (b'A' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// PUT /sheets/{id}/values
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct UpdateSheetValuesRequest {
+    pub range: String,
+    pub values: Vec<Vec<String>>,
+}
+
+async fn update_sheet_values_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSheetValuesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if req.range.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: 'range'"})),
+        ));
+    }
+
+    let result = state
+        .docs
+        .update_sheet_values(&id, &req.range, &req.values)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to update sheet values: {e}")})),
+            )
+        })?;
+
+    tracing::info!(sheet_id = %id, range = %req.range, "sheet values updated");
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// POST /forms
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateFormRequest {
+    pub title: String,
+}
+
+async fn create_form_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateFormRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if req.title.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: 'title'"})),
+        ));
+    }
+
+    let form = state.docs.create_form(&req.title).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create form: {e}")})),
+        )
+    })?;
+
+    let form_id = form.get("formId").and_then(|v| v.as_str()).unwrap_or("");
+    let responder_uri = form.get("responderUri").and_then(|v| v.as_str()).unwrap_or("");
+
+    tracing::info!(form_id, title = %req.title, "form created");
+
+    Ok(Json(serde_json::json!({
+        "form_id": form_id,
+        "title": req.title,
+        "responder_uri": responder_uri,
+        "edit_link": format!("https://docs.google.com/forms/d/{}/edit", form_id)
     })))
 }
 

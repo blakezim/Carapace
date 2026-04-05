@@ -183,6 +183,45 @@ impl GDocsAdapter {
         self.post("/docs", payload).await
     }
 
+    /// Create a new Google Sheet, optionally in a folder, with optional initial data.
+    pub async fn create_spreadsheet(
+        &self,
+        name: &str,
+        folder_id: Option<&str>,
+        data: Option<&Vec<Vec<String>>>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        debug!(name, "gdocs create_spreadsheet");
+        let mut payload = serde_json::json!({"name": name});
+        if let Some(fid) = folder_id {
+            payload["folder_id"] = serde_json::json!(fid);
+        }
+        if let Some(d) = data {
+            payload["data"] = serde_json::json!(d);
+        }
+        self.post("/sheets", payload).await
+    }
+
+    /// Write values to a sheet range.
+    pub async fn update_sheet_values(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+        values: &Vec<Vec<String>>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        debug!(spreadsheet_id, range, "gdocs update_sheet_values");
+        let payload = serde_json::json!({"range": range, "values": values});
+        self.put(&format!("/sheets/{}/values", url_encode(spreadsheet_id)), payload).await
+    }
+
+    /// Create a Google Form.
+    pub async fn create_form(
+        &self,
+        title: &str,
+    ) -> Result<serde_json::Value, AdapterError> {
+        debug!(title, "gdocs create_form");
+        self.post("/forms", serde_json::json!({"title": title})).await
+    }
+
     /// Copy a file.
     pub async fn copy_file(
         &self,

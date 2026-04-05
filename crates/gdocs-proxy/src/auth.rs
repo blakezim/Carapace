@@ -256,12 +256,13 @@ pub async fn run_oauth_setup(config_path: PathBuf, client_json: Option<PathBuf>)
 
     let app = axum::Router::new().route("/", axum::routing::get(callback_handler));
 
-    // Scopes: drive.readonly (list/search), docs/sheets/slides/forms.readonly (read content), drive.file (create/edit own)
+    // Scopes: drive (list/search/create), docs/sheets/slides/forms (read + create), drive.file (edit own files)
     let scopes = "https://www.googleapis.com/auth/drive.readonly%20\
                   https://www.googleapis.com/auth/documents.readonly%20\
                   https://www.googleapis.com/auth/spreadsheets.readonly%20\
                   https://www.googleapis.com/auth/presentations.readonly%20\
                   https://www.googleapis.com/auth/forms.body.readonly%20\
+                  https://www.googleapis.com/auth/forms.body%20\
                   https://www.googleapis.com/auth/forms.responses.readonly%20\
                   https://www.googleapis.com/auth/drive.file";
 

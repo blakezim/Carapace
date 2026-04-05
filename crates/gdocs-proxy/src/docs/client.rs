@@ -115,6 +115,55 @@ impl DocsClient {
         resp.json().await.context("failed to deserialize folder metadata")
     }
 
+    /// Create a Google Sheet via Drive API, optionally in a folder.
+    pub async fn create_spreadsheet(&self, name: &str, parent_id: Option<&str>) -> Result<DriveFile> {
+        let auth = self.auth_header().await?;
+        let mut metadata = json!({
+            "name": name,
+            "mimeType": "application/vnd.google-apps.spreadsheet"
+        });
+        if let Some(pid) = parent_id {
+            metadata["parents"] = json!([pid]);
+        }
+        let resp = self
+            .http_client
+            .post(format!("{}/files", self.drive_base_url))
+            .header("Authorization", &auth)
+            .query(&[("fields", "id,name,mimeType,createdTime,modifiedTime,owners,webViewLink")])
+            .json(&metadata)
+            .send()
+            .await
+            .context("Drive create_spreadsheet request failed")?;
+        let resp = check_status(resp, "Drive create_spreadsheet").await?;
+        resp.json().await.context("failed to deserialize spreadsheet metadata")
+    }
+
+    /// Write values to a Google Sheet range.
+    pub async fn update_sheet_values(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+        values: &[Vec<String>],
+    ) -> Result<serde_json::Value> {
+        let auth = self.auth_header().await?;
+        let body = json!({
+            "values": values
+        });
+        let resp = self
+            .http_client
+            .put(format!(
+                "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{range}",
+            ))
+            .header("Authorization", &auth)
+            .query(&[("valueInputOption", "USER_ENTERED")])
+            .json(&body)
+            .send()
+            .await
+            .context("Sheets update values request failed")?;
+        let resp = check_status(resp, "Sheets update values").await?;
+        resp.json().await.context("failed to deserialize sheets update response")
+    }
+
     /// Copy a file. Returns the new file's metadata.
     pub async fn copy_file(&self, file_id: &str, new_title: Option<&str>) -> Result<DriveFile> {
         let auth = self.auth_header().await?;
@@ -206,6 +255,21 @@ impl DocsClient {
             .await
             .context("Forms get_form request failed")?;
         let resp = check_status(resp, "Forms get_form").await?;
+        resp.json().await.context("failed to deserialize form")
+    }
+
+    /// Create a Google Form with the given title.
+    pub async fn create_form(&self, title: &str) -> Result<serde_json::Value> {
+        let auth = self.auth_header().await?;
+        let resp = self
+            .http_client
+            .post("https://forms.googleapis.com/v1/forms")
+            .header("Authorization", &auth)
+            .json(&json!({"info": {"title": title}}))
+            .send()
+            .await
+            .context("Forms create request failed")?;
+        let resp = check_status(resp, "Forms create").await?;
         resp.json().await.context("failed to deserialize form")
     }
 

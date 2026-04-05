@@ -228,11 +228,71 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
                     }
                 }
             }
+            "create_sheet" => {
+                let name = match req.params.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => n,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"name\""),
+                };
+                let folder_id = req.params.get("folder_id").and_then(|v| v.as_str());
+                let data: Option<Vec<Vec<String>>> = req.params.get("data")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                match adapter.create_spreadsheet(name, folder_id, data.as_ref()).await {
+                    Ok(result) => {
+                        info!(name, "gdocs spreadsheet created");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs create_spreadsheet failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_sheet failed: {e}"));
+                    }
+                }
+            }
+            "update_sheet" => {
+                let spreadsheet_id = match req.params.get("spreadsheet_id").and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"spreadsheet_id\""),
+                };
+                let range = match req.params.get("range").and_then(|v| v.as_str()) {
+                    Some(r) => r,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"range\""),
+                };
+                let values: Vec<Vec<String>> = match req.params.get("values")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()) {
+                    Some(v) => v,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing or invalid param: \"values\" (expected array of arrays)"),
+                };
+                match adapter.update_sheet_values(spreadsheet_id, range, &values).await {
+                    Ok(result) => {
+                        info!(spreadsheet_id, range, "gdocs sheet values updated");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs update_sheet failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("update_sheet failed: {e}"));
+                    }
+                }
+            }
+            "create_form" => {
+                let title = match req.params.get("title").and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"title\""),
+                };
+                match adapter.create_form(title).await {
+                    Ok(result) => {
+                        info!(title, "gdocs form created");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs create_form failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_form failed: {e}"));
+                    }
+                }
+            }
             _ => {
                 return JsonRpcResponse::error(
                     req.id.clone(),
                     protocol::METHOD_NOT_FOUND,
-                    "Google Docs channel.send requires an 'action' param: 'copy', 'append', or 'create_folder'",
+                    "Google Docs channel.send requires an 'action' param: 'copy', 'append', 'create_folder', 'create_sheet', 'update_sheet', or 'create_form'",
                 );
             }
         }

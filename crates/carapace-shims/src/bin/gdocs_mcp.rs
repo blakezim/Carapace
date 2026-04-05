@@ -311,6 +311,83 @@ Use this after gdocs_create or gdocs_copy to add content to a document.",
             }
         },
         {
+            "name": "gdocs_create_sheet",
+            "description": "\
+Create a new Google Sheet with the given name. Optionally provide initial data as rows of cell values \
+and a folder_id to place it in a specific folder. \
+Returns the spreadsheet ID and a link to open it. \
+The agent can later update this sheet using gdocs_update_sheet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the new spreadsheet."
+                    },
+                    "folder_id": {
+                        "type": "string",
+                        "description": "Optional folder ID to create the sheet in."
+                    },
+                    "data": {
+                        "type": "array",
+                        "description": "Optional initial data. Array of rows, each row is an array of cell values as strings. First row is typically headers.",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "gdocs_update_sheet",
+            "description": "\
+Write values to a range in a Google Sheet. Only works on sheets the agent created or copied \
+(enforced by OAuth scope). Use A1 notation for the range (e.g. 'Sheet1!A1:C3', 'Sheet1!A1'). \
+Values are parsed as if typed by a user (numbers, dates, formulas all work).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "spreadsheet_id": {
+                        "type": "string",
+                        "description": "The spreadsheet ID to update."
+                    },
+                    "range": {
+                        "type": "string",
+                        "description": "The A1 notation range to write to (e.g. 'Sheet1!A1:D10')."
+                    },
+                    "values": {
+                        "type": "array",
+                        "description": "Array of rows to write. Each row is an array of cell values as strings.",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["spreadsheet_id", "range", "values"]
+            }
+        },
+        {
+            "name": "gdocs_create_form",
+            "description": "\
+Create a new Google Form with the given title. Returns the form ID, a link to edit it, \
+and the responder URI (shareable link for filling out the form). \
+Note: the Forms API only supports creating empty forms — questions must be added \
+manually in the Google Forms editor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Title for the new form."
+                    }
+                },
+                "required": ["title"]
+            }
+        },
+        {
             "name": "gdocs_create_folder",
             "description": "\
 Create a folder in Google Drive. Optionally specify a parent folder ID to nest it. \
@@ -497,6 +574,85 @@ fn call_tool(
             match gw.call("channel.send", gw_params) {
                 Ok(result) => tool_success(id, result),
                 Err(e) => tool_error(id, format!("gdocs_append failed: {e}")),
+            }
+        }
+
+        "gdocs_create_sheet" => {
+            let name = match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return tool_error(id, "Missing required argument: \"name\""),
+            };
+
+            let mut gw_params = with_account(
+                json!({
+                    "channel": "gdocs",
+                    "action": "create_sheet",
+                    "name": name,
+                }),
+                gdocs_account,
+            );
+            if let Some(folder_id) = args.get("folder_id").and_then(|v| v.as_str()) {
+                gw_params["folder_id"] = json!(folder_id);
+            }
+            if let Some(data) = args.get("data") {
+                gw_params["data"] = data.clone();
+            }
+
+            match gw.call("channel.send", gw_params) {
+                Ok(result) => tool_success(id, result),
+                Err(e) => tool_error(id, format!("gdocs_create_sheet failed: {e}")),
+            }
+        }
+
+        "gdocs_update_sheet" => {
+            let spreadsheet_id = match args.get("spreadsheet_id").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return tool_error(id, "Missing required argument: \"spreadsheet_id\""),
+            };
+            let range = match args.get("range").and_then(|v| v.as_str()) {
+                Some(r) => r,
+                None => return tool_error(id, "Missing required argument: \"range\""),
+            };
+            let values = match args.get("values") {
+                Some(v) => v.clone(),
+                None => return tool_error(id, "Missing required argument: \"values\""),
+            };
+
+            let gw_params = with_account(
+                json!({
+                    "channel": "gdocs",
+                    "action": "update_sheet",
+                    "spreadsheet_id": spreadsheet_id,
+                    "range": range,
+                    "values": values,
+                }),
+                gdocs_account,
+            );
+
+            match gw.call("channel.send", gw_params) {
+                Ok(result) => tool_success(id, result),
+                Err(e) => tool_error(id, format!("gdocs_update_sheet failed: {e}")),
+            }
+        }
+
+        "gdocs_create_form" => {
+            let title = match args.get("title").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => return tool_error(id, "Missing required argument: \"title\""),
+            };
+
+            let gw_params = with_account(
+                json!({
+                    "channel": "gdocs",
+                    "action": "create_form",
+                    "title": title,
+                }),
+                gdocs_account,
+            );
+
+            match gw.call("channel.send", gw_params) {
+                Ok(result) => tool_success(id, result),
+                Err(e) => tool_error(id, format!("gdocs_create_form failed: {e}")),
             }
         }
 
