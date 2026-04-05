@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "sudo",
+      "args": ["-u", "carapace", "/usr/local/bin/gmail-mcp"]
+    }
+  }
+}

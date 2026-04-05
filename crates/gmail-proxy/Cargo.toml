@@ -1,0 +1,29 @@
+[package]
+name = "gmail-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Secure Gmail proxy for Carapace — OAuth, content scrubbing, draft creation"
+
+[[bin]]
+name = "gmail-proxy"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+regex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow = "1"
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+open = "5"
+dirs = "5"
+nix = { version = "0.29", features = ["user", "fs"] }
+futures = "0.3"

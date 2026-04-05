@@ -3,6 +3,8 @@
 //! Routes requests to the appropriate channel adapter with allowlist
 //! enforcement, audit logging, and dead letter storage for blocked sends.
 
+use std::time::Duration;
+
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -10,11 +12,18 @@ use tracing::{info, warn};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::adapters::gmail::GmailAdapter;
 use crate::adapters::imsg::ImsgAdapter;
 use crate::allowlist::{Allowlist, AllowlistResult};
 use crate::audit::{self, AuditLogger};
 use crate::dead_letter::{DeadLetter, DeadLetterQueue};
 use crate::protocol::{self, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ProcessResult};
+
+/// A resolved channel adapter (one of the supported channels).
+enum Channel<'a> {
+    Imsg(&'a ImsgAdapter),
+    Gmail(&'a GmailAdapter),
+}
 
 /// Shared channel state, borrowed from AppState.
 pub struct ChannelContext<'a> {
@@ -23,9 +32,10 @@ pub struct ChannelContext<'a> {
     pub imsg_inbound: Option<&'a Allowlist>,
     pub audit_logger: &'a AuditLogger,
     pub dead_letter_queue: &'a DeadLetterQueue,
-    /// Shared across all watch subscriptions — prevents re-delivering messages
-    /// already seen in a previous subscription session.
+    /// Shared across all iMessage watch subscriptions.
     pub seen_message_ids: Arc<tokio::sync::Mutex<HashSet<u64>>>,
+    pub gmail_adapter: Option<&'a GmailAdapter>,
+    pub gmail_inbound: Option<&'a Allowlist>,
 }
 
 /// Handle a `channel.*` JSON-RPC request.
@@ -41,6 +51,9 @@ pub async fn handle_channel_request(
         "channel.get_history" => ProcessResult::Response(handle_get_history(req, ctx).await),
         "channel.status" => ProcessResult::Response(handle_status(req, ctx).await),
         "channel.watch" => handle_watch(req, ctx).await,
+        // Gmail-specific methods
+        "channel.search" => ProcessResult::Response(handle_search(req, ctx).await),
+        "channel.create_draft" => ProcessResult::Response(handle_create_draft(req, ctx).await),
         _ => {
             warn!(method = %req.method, "unknown channel method");
             ProcessResult::Response(JsonRpcResponse::error(
@@ -56,18 +69,25 @@ pub async fn handle_channel_request(
 fn resolve_channel<'a>(
     params: &serde_json::Value,
     ctx: &'a ChannelContext<'_>,
-) -> Result<&'a ImsgAdapter, JsonRpcResponse> {
+) -> Result<Channel<'a>, JsonRpcResponse> {
     let channel = params
         .get("channel")
         .and_then(|v| v.as_str())
         .unwrap_or("imsg");
 
     match channel {
-        "imsg" => ctx.imsg_adapter.ok_or_else(|| {
+        "imsg" => ctx.imsg_adapter.map(Channel::Imsg).ok_or_else(|| {
             JsonRpcResponse::error(
                 serde_json::Value::Null,
                 protocol::CHANNEL_UNAVAILABLE,
                 "iMessage channel is not configured or unavailable",
+            )
+        }),
+        "gmail" => ctx.gmail_adapter.map(Channel::Gmail).ok_or_else(|| {
+            JsonRpcResponse::error(
+                serde_json::Value::Null,
+                protocol::CHANNEL_UNAVAILABLE,
+                "Gmail channel is not configured or unavailable",
             )
         }),
         other => Err(JsonRpcResponse::error(
@@ -81,7 +101,20 @@ fn resolve_channel<'a>(
 // ── channel.send ────────────────────────────────────────────────────────────
 
 async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
-    // Validate required params.
+    // Resolve channel first so channel-level rejections take priority over param validation.
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return e; }
+    };
+
+    if let Channel::Gmail(_) = channel {
+        return JsonRpcResponse::error(
+            req.id.clone(),
+            protocol::METHOD_NOT_FOUND,
+            "Gmail channel does not support direct send. Use channel.create_draft instead.",
+        );
+    }
+
     let recipient = match req.params.get("recipient").and_then(|v| v.as_str()) {
         Some(r) => r,
         None => {
@@ -108,91 +141,70 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
         .params
         .get("attachments")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    // Resolve channel adapter.
-    let adapter = match resolve_channel(&req.params, ctx) {
-        Ok(a) => a,
-        Err(mut e) => {
-            e.id = req.id.clone();
-            return e;
+    match channel {
+        Channel::Imsg(adapter) => {
+            // Check outbound allowlist.
+            if let Some(allowlist) = ctx.imsg_outbound {
+                if let AllowlistResult::Blocked { mode, identifier } = allowlist.check(recipient) {
+                    let reason = format!("Recipient {identifier} blocked by {mode}");
+                    ctx.audit_logger.log(audit::blocked(&req.method, &req.id, &reason)).await;
+                    ctx.dead_letter_queue
+                        .store(DeadLetter::new(
+                            req.method.clone(), req.id.clone(),
+                            req.params.clone(), reason.clone(),
+                        ))
+                        .await;
+                    return JsonRpcResponse::error(req.id.clone(), protocol::NOT_IN_ALLOWLIST, reason);
+                }
+            }
+            match adapter.send(recipient, message, &attachments).await {
+                Ok(result) => {
+                    info!(recipient, "message sent via imsg");
+                    JsonRpcResponse::success(req.id.clone(), serde_json::to_value(&result).unwrap())
+                }
+                Err(e) => {
+                    warn!(error = %e, "imsg send failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::SEND_FAILED, format!("Send failed: {e}"))
+                }
+            }
         }
-    };
-
-    // Check outbound allowlist.
-    if let Some(allowlist) = ctx.imsg_outbound {
-        if let AllowlistResult::Blocked { mode, identifier } = allowlist.check(recipient) {
-            let reason = format!("Recipient {identifier} blocked by {mode}");
-
-            ctx.audit_logger
-                .log(audit::blocked(&req.method, &req.id, &reason))
-                .await;
-
-            ctx.dead_letter_queue
-                .store(DeadLetter::new(
-                    req.method.clone(),
-                    req.id.clone(),
-                    req.params.clone(),
-                    reason.clone(),
-                ))
-                .await;
-
-            return JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::NOT_IN_ALLOWLIST,
-                reason,
-            );
-        }
-    }
-
-    // Call adapter.
-    match adapter.send(recipient, message, &attachments).await {
-        Ok(result) => {
-            info!(recipient, "message sent via imsg");
-            JsonRpcResponse::success(req.id.clone(), serde_json::to_value(&result).unwrap())
-        }
-        Err(e) => {
-            warn!(error = %e, "imsg send failed");
-            JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::SEND_FAILED,
-                format!("Send failed: {e}"),
-            )
-        }
+        Channel::Gmail(_) => unreachable!("Gmail send blocked above"),
     }
 }
 
 // ── channel.list_chats ──────────────────────────────────────────────────────
 
 async fn handle_list_chats(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
-    let adapter = match resolve_channel(&req.params, ctx) {
-        Ok(a) => a,
-        Err(mut e) => {
-            e.id = req.id.clone();
-            return e;
-        }
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return e; }
     };
 
-    let limit = req
-        .params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
+    let limit = req.params.get("limit").and_then(|v| v.as_u64()).map(|n| n as u32);
 
-    match adapter.list_chats(limit).await {
-        Ok(chats) => JsonRpcResponse::success(req.id.clone(), chats),
-        Err(e) => {
-            warn!(error = %e, "imsg list_chats failed");
-            JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::INTERNAL_ERROR,
-                format!("list_chats failed: {e}"),
-            )
+    match channel {
+        Channel::Imsg(adapter) => {
+            match adapter.list_chats(limit).await {
+                Ok(chats) => JsonRpcResponse::success(req.id.clone(), chats),
+                Err(e) => {
+                    warn!(error = %e, "imsg list_chats failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("list_chats failed: {e}"))
+                }
+            }
+        }
+        Channel::Gmail(adapter) => {
+            // For Gmail, list_chats returns recent inbox threads.
+            let max = limit.unwrap_or(20);
+            match adapter.search("in:inbox", Some(max), None).await {
+                Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
+                Err(e) => {
+                    warn!(error = %e, "gmail list_chats (inbox search) failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("list_chats failed: {e}"))
+                }
+            }
         }
     }
 }
@@ -204,38 +216,39 @@ async fn handle_get_history(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> J
         Some(id) => id,
         None => {
             return JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::INVALID_PARAMS,
+                req.id.clone(), protocol::INVALID_PARAMS,
                 "Missing required param: \"chat_id\"",
             );
         }
     };
 
-    let adapter = match resolve_channel(&req.params, ctx) {
-        Ok(a) => a,
-        Err(mut e) => {
-            e.id = req.id.clone();
-            return e;
-        }
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return e; }
     };
 
-    let limit = req
-        .params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-
+    let limit = req.params.get("limit").and_then(|v| v.as_u64()).map(|n| n as u32);
     let before = req.params.get("before").and_then(|v| v.as_str());
 
-    match adapter.get_history(chat_id, limit, before).await {
-        Ok(history) => JsonRpcResponse::success(req.id.clone(), history),
-        Err(e) => {
-            warn!(error = %e, "imsg get_history failed");
-            JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::INTERNAL_ERROR,
-                format!("get_history failed: {e}"),
-            )
+    match channel {
+        Channel::Imsg(adapter) => {
+            match adapter.get_history(chat_id, limit, before).await {
+                Ok(history) => JsonRpcResponse::success(req.id.clone(), history),
+                Err(e) => {
+                    warn!(error = %e, "imsg get_history failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("get_history failed: {e}"))
+                }
+            }
+        }
+        Channel::Gmail(adapter) => {
+            // For Gmail, chat_id is the thread ID.
+            match adapter.get_thread(chat_id).await {
+                Ok(thread) => JsonRpcResponse::success(req.id.clone(), thread),
+                Err(e) => {
+                    warn!(error = %e, "gmail get_history (get_thread) failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("get_history failed: {e}"))
+                }
+            }
         }
     }
 }
@@ -243,11 +256,7 @@ async fn handle_get_history(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> J
 // ── channel.status ──────────────────────────────────────────────────────────
 
 async fn handle_status(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
-    let channel = req
-        .params
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or("imsg");
+    let channel = req.params.get("channel").and_then(|v| v.as_str()).unwrap_or("imsg");
 
     match channel {
         "imsg" => {
@@ -258,29 +267,37 @@ async fn handle_status(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
             };
 
             let outbound_info = ctx.imsg_outbound.map(|al| {
-                json!({
-                    "mode": al.mode_str(),
-                    "entries": al.entry_count(),
-                })
+                json!({ "mode": al.mode_str(), "entries": al.entry_count() })
             });
-
             let inbound_info = ctx.imsg_inbound.map(|al| {
-                json!({
-                    "mode": al.mode_str(),
-                    "entries": al.entry_count(),
-                })
+                json!({ "mode": al.mode_str(), "entries": al.entry_count() })
             });
 
-            JsonRpcResponse::success(
-                req.id.clone(),
-                json!({
-                    "channel": "imsg",
-                    "configured": configured,
-                    "health": health.map(|h| serde_json::to_value(&h).unwrap()),
-                    "outbound": outbound_info,
-                    "inbound": inbound_info,
-                }),
-            )
+            JsonRpcResponse::success(req.id.clone(), json!({
+                "channel": "imsg",
+                "configured": configured,
+                "health": health.map(|h| serde_json::to_value(&h).unwrap()),
+                "outbound": outbound_info,
+                "inbound": inbound_info,
+            }))
+        }
+        "gmail" => {
+            let (configured, health) = if let Some(adapter) = ctx.gmail_adapter {
+                (true, Some(adapter.health_check().await))
+            } else {
+                (false, None)
+            };
+
+            let inbound_info = ctx.gmail_inbound.map(|al| {
+                json!({ "mode": al.mode_str(), "entries": al.entry_count() })
+            });
+
+            JsonRpcResponse::success(req.id.clone(), json!({
+                "channel": "gmail",
+                "configured": configured,
+                "health": health.map(|h| serde_json::to_value(&h).unwrap()),
+                "inbound": inbound_info,
+            }))
         }
         other => JsonRpcResponse::error(
             req.id.clone(),
@@ -290,81 +307,169 @@ async fn handle_status(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
     }
 }
 
-// ── channel.watch ──────────────────────────────────────────────────────
+// ── channel.watch ──────────────────────────────────────────────────────────
 
 async fn handle_watch(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> ProcessResult {
-    let adapter = match resolve_channel(&req.params, ctx) {
-        Ok(a) => a,
-        Err(mut e) => {
-            e.id = req.id.clone();
-            return ProcessResult::Response(e);
-        }
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return ProcessResult::Response(e); }
     };
 
-    let since_rowid = adapter.max_message_rowid().await;
-    let (watch_handle, mut adapter_rx) = match adapter.watch(128, since_rowid) {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(error = %e, "imsg watch failed to start");
-            return ProcessResult::Response(JsonRpcResponse::error(
-                req.id.clone(),
-                protocol::INTERNAL_ERROR,
-                format!("watch failed: {e}"),
-            ));
-        }
-    };
-
-    let inbound = ctx.imsg_inbound.cloned();
-    let seen = Arc::clone(&ctx.seen_message_ids);
-    let (tx, rx) = mpsc::channel::<JsonRpcNotification>(128);
-
-    // Spawn a filtering task that reads from the adapter and applies
-    // the inbound allowlist and deduplication before forwarding notifications.
-    tokio::spawn(async move {
-        let _handle = watch_handle; // move ownership so child lives until task ends
-
-        while let Some(event) = adapter_rx.recv().await {
-            // Deduplicate by message ID — skip any message already forwarded
-            // in this or a previous subscription session.
-            if let Some(id) = event.get("id").and_then(|v| v.as_u64()) {
-                let mut seen_guard = seen.lock().await;
-                if seen_guard.contains(&id) {
-                    continue; // already delivered
+    match channel {
+        Channel::Imsg(adapter) => {
+            let since_rowid = adapter.max_message_rowid().await;
+            let (watch_handle, mut adapter_rx) = match adapter.watch(128, since_rowid) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(error = %e, "imsg watch failed to start");
+                    return ProcessResult::Response(JsonRpcResponse::error(
+                        req.id.clone(), protocol::INTERNAL_ERROR,
+                        format!("watch failed: {e}"),
+                    ));
                 }
-                seen_guard.insert(id);
-            }
+            };
 
-            // Check inbound allowlist if configured.
-            if let Some(ref al) = inbound {
-                let sender = event
-                    .get("sender")
-                    .or_else(|| event.get("handle"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+            let inbound = ctx.imsg_inbound.cloned();
+            let seen = Arc::clone(&ctx.seen_message_ids);
+            let (tx, rx) = mpsc::channel::<JsonRpcNotification>(128);
 
-                if let AllowlistResult::Blocked { .. } = al.check(sender) {
-                    continue; // silently drop
+            tokio::spawn(async move {
+                let _handle = watch_handle;
+                while let Some(event) = adapter_rx.recv().await {
+                    // Deduplicate by numeric message ID.
+                    if let Some(id) = event.get("id").and_then(|v| v.as_u64()) {
+                        let mut seen_guard = seen.lock().await;
+                        if seen_guard.contains(&id) { continue; }
+                        seen_guard.insert(id);
+                    }
+                    // Inbound allowlist.
+                    if let Some(ref al) = inbound {
+                        let sender = event.get("sender").or_else(|| event.get("handle"))
+                            .and_then(|v| v.as_str()).unwrap_or("");
+                        if let AllowlistResult::Blocked { .. } = al.check(sender) { continue; }
+                    }
+                    let notif = JsonRpcNotification::new("channel.watch", event);
+                    if tx.send(notif).await.is_err() { break; }
                 }
-            }
+            });
 
-            let notification =
-                JsonRpcNotification::new("channel.watch", event);
-            if tx.send(notification).await.is_err() {
-                break; // client disconnected
-            }
+            let ack = JsonRpcResponse::success(req.id.clone(), json!({"subscribed": true}));
+            ProcessResult::Subscription { ack, notifications: rx }
         }
-    });
 
-    let ack = JsonRpcResponse::success(
-        req.id.clone(),
-        json!({"subscribed": true}),
-    );
+        Channel::Gmail(adapter) => {
+            let poll_interval = Duration::from_secs(30);
+            let (watch_handle, mut adapter_rx) = adapter.watch(128, poll_interval);
+            let inbound = ctx.gmail_inbound.cloned();
+            let (tx, rx) = mpsc::channel::<JsonRpcNotification>(128);
 
-    ProcessResult::Subscription {
-        ack,
-        notifications: rx,
+            tokio::spawn(async move {
+                let _handle = watch_handle;
+                while let Some(event) = adapter_rx.recv().await {
+                    // Inbound allowlist (filter by From address).
+                    if let Some(ref al) = inbound {
+                        let sender = event.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                        if let AllowlistResult::Blocked { .. } = al.check(sender) { continue; }
+                    }
+                    let notif = JsonRpcNotification::new("channel.watch", event);
+                    if tx.send(notif).await.is_err() { break; }
+                }
+            });
+
+            let ack = JsonRpcResponse::success(req.id.clone(), json!({"subscribed": true}));
+            ProcessResult::Subscription { ack, notifications: rx }
+        }
     }
 }
+
+// ── channel.search (Gmail-specific) ─────────────────────────────────────────
+
+async fn handle_search(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
+    let query = match req.params.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => {
+            return JsonRpcResponse::error(
+                req.id.clone(), protocol::INVALID_PARAMS,
+                "Missing required param: \"query\"",
+            );
+        }
+    };
+
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return e; }
+    };
+
+    match channel {
+        Channel::Imsg(_) => JsonRpcResponse::error(
+            req.id.clone(), protocol::METHOD_NOT_FOUND,
+            "channel.search is only supported on the gmail channel",
+        ),
+        Channel::Gmail(adapter) => {
+            let max = req.params.get("max").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let page_token = req.params.get("page_token").and_then(|v| v.as_str());
+
+            match adapter.search(query, max, page_token).await {
+                Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
+                Err(e) => {
+                    warn!(error = %e, "gmail search failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("search failed: {e}"))
+                }
+            }
+        }
+    }
+}
+
+// ── channel.create_draft (Gmail-specific) ───────────────────────────────────
+
+async fn handle_create_draft(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
+    let to = match req.params.get("to").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            return JsonRpcResponse::error(
+                req.id.clone(), protocol::INVALID_PARAMS,
+                "Missing required param: \"to\"",
+            );
+        }
+    };
+    let subject = match req.params.get("subject").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            return JsonRpcResponse::error(
+                req.id.clone(), protocol::INVALID_PARAMS,
+                "Missing required param: \"subject\"",
+            );
+        }
+    };
+    let body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let cc = req.params.get("cc").and_then(|v| v.as_str());
+
+    let channel = match resolve_channel(&req.params, ctx) {
+        Ok(c) => c,
+        Err(mut e) => { e.id = req.id.clone(); return e; }
+    };
+
+    match channel {
+        Channel::Imsg(_) => JsonRpcResponse::error(
+            req.id.clone(), protocol::METHOD_NOT_FOUND,
+            "channel.create_draft is only supported on the gmail channel",
+        ),
+        Channel::Gmail(adapter) => {
+            match adapter.create_draft(to, subject, body, cc).await {
+                Ok(result) => {
+                    info!(to, subject, draft_id = %result.draft_id, "gmail draft created");
+                    JsonRpcResponse::success(req.id.clone(), serde_json::to_value(&result).unwrap())
+                }
+                Err(e) => {
+                    warn!(error = %e, "gmail create_draft failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_draft failed: {e}"))
+                }
+            }
+        }
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -391,7 +496,6 @@ mod tests {
         DeadLetterQueue::new(PathBuf::from("/tmp/carapace-test-channel-dead-letters"))
     }
 
-    /// Helper: unwrap ProcessResult::Response, panicking on Subscription.
     fn unwrap_response(pr: ProcessResult) -> JsonRpcResponse {
         match pr {
             ProcessResult::Response(r) => r,
@@ -403,19 +507,24 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(HashSet::new()))
     }
 
+    fn empty_ctx<'a>(audit: &'a AuditLogger, dlq: &'a DeadLetterQueue) -> ChannelContext<'a> {
+        ChannelContext {
+            imsg_adapter: None,
+            imsg_outbound: None,
+            imsg_inbound: None,
+            audit_logger: audit,
+            dead_letter_queue: dlq,
+            seen_message_ids: noop_seen(),
+            gmail_adapter: None,
+            gmail_inbound: None,
+        }
+    }
+
     #[tokio::test]
     async fn send_missing_recipient_rejected() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
+        let ctx = empty_ctx(&audit, &dlq);
         let req = make_req("channel.send", json!({"message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
@@ -425,15 +534,7 @@ mod tests {
     async fn send_missing_message_rejected() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
+        let ctx = empty_ctx(&audit, &dlq);
         let req = make_req("channel.send", json!({"recipient": "+1234567890"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
@@ -443,19 +544,8 @@ mod tests {
     async fn send_no_adapter_returns_unavailable() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
-        let req = make_req(
-            "channel.send",
-            json!({"recipient": "+1234567890", "message": "hello"}),
-        );
+        let ctx = empty_ctx(&audit, &dlq);
+        let req = make_req("channel.send", json!({"recipient": "+1234567890", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
     }
@@ -479,12 +569,10 @@ mod tests {
             audit_logger: &audit,
             dead_letter_queue: &dlq,
             seen_message_ids: noop_seen(),
+            gmail_adapter: None,
+            gmail_inbound: None,
         };
-
-        let req = make_req(
-            "channel.send",
-            json!({"recipient": "+9999999999", "message": "hello"}),
-        );
+        let req = make_req("channel.send", json!({"recipient": "+9999999999", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::NOT_IN_ALLOWLIST);
     }
@@ -493,19 +581,8 @@ mod tests {
     async fn unknown_channel_returns_unavailable() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
-        let req = make_req(
-            "channel.send",
-            json!({"channel": "signal", "recipient": "+1234567890", "message": "hi"}),
-        );
+        let ctx = empty_ctx(&audit, &dlq);
+        let req = make_req("channel.send", json!({"channel": "signal", "recipient": "+1234567890", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
     }
@@ -514,15 +591,7 @@ mod tests {
     async fn unknown_channel_method() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
+        let ctx = empty_ctx(&audit, &dlq);
         let req = make_req("channel.unknown", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
@@ -532,22 +601,39 @@ mod tests {
     async fn get_history_missing_chat_id() {
         let audit = noop_audit();
         let dlq = noop_dead_letter();
-        let ctx = ChannelContext {
-            imsg_adapter: None,
-            imsg_outbound: None,
-            imsg_inbound: None,
-            audit_logger: &audit,
-            dead_letter_queue: &dlq,
-            seen_message_ids: noop_seen(),
-        };
-
+        let ctx = empty_ctx(&audit, &dlq);
         let req = make_req("channel.get_history", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
     #[tokio::test]
-    async fn status_unconfigured_channel() {
+    async fn status_unconfigured_imsg() {
+        let audit = noop_audit();
+        let dlq = noop_dead_letter();
+        let ctx = empty_ctx(&audit, &dlq);
+        let req = make_req("channel.status", json!({}));
+        let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
+        let result = resp.result.unwrap();
+        assert_eq!(result["channel"], "imsg");
+        assert_eq!(result["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn status_unconfigured_gmail() {
+        let audit = noop_audit();
+        let dlq = noop_dead_letter();
+        let ctx = empty_ctx(&audit, &dlq);
+        let req = make_req("channel.status", json!({"channel": "gmail"}));
+        let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
+        let result = resp.result.unwrap();
+        assert_eq!(result["channel"], "gmail");
+        assert_eq!(result["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn gmail_send_returns_not_supported() {
+        let adapter = GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock"));
         let audit = noop_audit();
         let dlq = noop_dead_letter();
         let ctx = ChannelContext {
@@ -557,12 +643,31 @@ mod tests {
             audit_logger: &audit,
             dead_letter_queue: &dlq,
             seen_message_ids: noop_seen(),
+            gmail_adapter: Some(&adapter),
+            gmail_inbound: None,
         };
-
-        let req = make_req("channel.status", json!({}));
+        let req = make_req("channel.send", json!({"channel": "gmail", "recipient": "a@b.com", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
-        let result = resp.result.unwrap();
-        assert_eq!(result["channel"], "imsg");
-        assert_eq!(result["configured"], false);
+        assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_draft_missing_to() {
+        let adapter = GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock"));
+        let audit = noop_audit();
+        let dlq = noop_dead_letter();
+        let ctx = ChannelContext {
+            imsg_adapter: None,
+            imsg_outbound: None,
+            imsg_inbound: None,
+            audit_logger: &audit,
+            dead_letter_queue: &dlq,
+            seen_message_ids: noop_seen(),
+            gmail_adapter: Some(&adapter),
+            gmail_inbound: None,
+        };
+        let req = make_req("channel.create_draft", json!({"channel": "gmail", "subject": "Hello"}));
+        let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 }

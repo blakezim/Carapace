@@ -3,6 +3,7 @@ members = [
     "crates/carapace-daemon",
     "crates/carapace-client",
     "crates/carapace-shims",
+    "crates/gmail-proxy",
 ]
 resolver = "2"
 

@@ -1,0 +1,50 @@
+# gmail-proxy configuration
+# Copy to /etc/carapace/gmail-proxy.toml and fill in your values.
+# Then run:  gmail-proxy setup --config /etc/carapace/gmail-proxy.toml --client-json ~/client_secret.json
+
+[auth]
+# OAuth 2.0 credentials from Google Cloud Console.
+# Can be filled automatically by `gmail-proxy setup --client-json`.
+client_id     = "YOUR_CLIENT_ID.apps.googleusercontent.com"
+client_secret = "YOUR_CLIENT_SECRET"
+# Path to secrets.toml (relative to this file). Must be 0600.
+secrets_file  = "gmail-proxy-secrets.toml"
+
+[gmail]
+# The Gmail account this proxy serves.
+account = "you@gmail.com"
+
+[scrub]
+# Messages labelled with this label are hidden from all API responses.
+# Create it in Gmail at mail.google.com before starting the proxy.
+blocked_label = "AI-BLOCKED"
+
+# Redact OTP codes in message bodies.
+otp_patterns = [
+    '(?i)\b\d{6}\b',
+    '(?i)\b\d{4}\b',
+]
+
+# Redact authentication / password-reset URLs.
+url_strip_patterns = [
+    '(?i)https?://[^\s]*(?:reset|verify|confirm|login|signin|auth|token)[^\s]*',
+]
+
+# Block messages from senders matching any of these patterns.
+blocked_sender_patterns = []
+
+# Set true to strip ALL https?:// links (not just auth URLs).
+strip_links = false
+
+# Gmail search operators that agents are allowed to use.
+allowed_operators = [
+    "from", "to", "subject",
+    "after", "before", "older_than", "newer_than",
+    "is", "has", "in", "filename", "cc", "bcc",
+]
+
+[proxy]
+# Unix socket exposed to the Carapace gateway daemon.
+socket_path = "/var/run/carapace/gmail-proxy.sock"
+# Number of Gmail API requests to make concurrently when fetching search results.
+search_fetch_concurrency = 4

@@ -13,6 +13,10 @@ path = "src/bin/test_shim.rs"
 name = "imsg"
 path = "src/bin/imsg_shim.rs"
 
+[[bin]]
+name = "gmail-mcp"
+path = "src/bin/gmail_mcp.rs"
+
 [dependencies]
 carapace-client = { path = "../carapace-client" }
 serde_json.workspace = true

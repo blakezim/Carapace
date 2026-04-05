@@ -44,6 +44,23 @@ impl Default for GatewayConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct ChannelsConfig {
     pub imsg: Option<ImsgChannelConfig>,
+    pub gmail: Option<GmailChannelConfig>,
+}
+
+/// Configuration for the Gmail channel.
+#[derive(Debug, Deserialize)]
+pub struct GmailChannelConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Path to the gmail-proxy Unix socket.
+    #[serde(default = "default_gmail_socket")]
+    pub proxy_socket: PathBuf,
+    #[serde(default)]
+    pub inbound: DirectionConfig,
+}
+
+fn default_gmail_socket() -> PathBuf {
+    PathBuf::from("/var/run/carapace/gmail-proxy.sock")
 }
 
 /// Configuration for the iMessage channel.
@@ -378,6 +395,26 @@ allowlist = ["blocked@example.com"]
         let imsg = config.channels.imsg.unwrap();
         assert_eq!(imsg.outbound.mode, AllowlistMode::Denylist);
         assert_eq!(imsg.outbound.allowlist.len(), 1);
+    }
+
+    #[test]
+    fn parse_gmail_channel_config() {
+        let toml_str = r#"
+[channels.gmail]
+enabled = true
+proxy_socket = "/var/run/carapace/gmail-proxy.sock"
+
+[channels.gmail.inbound]
+mode = "open"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let gmail = config.channels.gmail.unwrap();
+        assert!(gmail.enabled);
+        assert_eq!(
+            gmail.proxy_socket,
+            PathBuf::from("/var/run/carapace/gmail-proxy.sock")
+        );
+        assert_eq!(gmail.inbound.mode, AllowlistMode::Open);
     }
 
     #[test]

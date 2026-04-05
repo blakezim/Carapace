@@ -338,14 +338,54 @@ Once Phase 3 works, we add security layers:
 
 **Goal:** Support Signal, Discord, Gmail
 
-**Status:** Planned
+**Status:** Gmail complete ✅ — Signal and Discord planned
 
+### Gmail ✅
+- [x] `gmail-proxy` daemon (OAuth 2.0, content scrubbing, Unix socket HTTP API)
+- [x] `GmailAdapter` in carapace-daemon (HTTP client over Unix socket)
+- [x] `channel.search`, `channel.get_history`, `channel.create_draft`, `channel.watch`, `channel.status`
+- [x] `channel.send` blocked — returns error -32601
+- [x] `gmail-mcp` MCP server (four named tools for agents)
+- [x] Configured in Claude Code (`.mcp.json` in project root)
+- [x] Configured in OpenClaw (`openclaw mcp set gmail`)
+- [x] Content scrubbing: OTP redaction, auth URL stripping, `AI-BLOCKED` label
+- [x] Read-only — OAuth scopes are `gmail.readonly` + `gmail.compose` only
+- [x] Emails fetched without changing read/unread status
+
+### Gmail — Future: Multi-Account Support
+
+**The idea:** Rather than building one proxy that handles multiple accounts, use the per-agent MCP server architecture to give each agent its own Gmail account.
+
+**How it would work:**
+```
+main agent     → gmail-mcp (personal) → gmail-proxy-personal.sock → zimmermanhq@gmail.com
+sunnysidelab  → gmail-mcp (work)      → gmail-proxy-work.sock     → work@company.com
+wedding       → gmail-mcp (wedding)   → gmail-proxy-wedding.sock  → wedding@gmail.com
+```
+
+**What's needed:**
+1. **Multiple `gmail-proxy` instances** — each with its own config file, OAuth credentials, and socket path
+2. **`gmail-mcp` account selection** — accept a `--socket` arg or `CARAPACE_GMAIL_SOCKET` env var so different instances point to different proxies
+3. **Per-agent MCP config in OpenClaw** — verify whether `openclaw mcp set` supports `--agent <id>` flag or if it requires placing a `.mcp.json` in each agent's `agentDir`
+4. **Per-agent MCP config in Claude Code** — already supported via `.mcp.json` in the project directory
+
+**Why this is better than a single multi-account proxy:**
+- Each account is fully isolated — a bug in one proxy can't affect another
+- Different scrubbing rules per account (e.g. work email keeps links, personal strips them)
+- Easy to add/remove accounts without touching shared infrastructure
+- Failure of one account's OAuth doesn't affect other accounts
+
+**Investigation needed:**
+- Check if `openclaw mcp set` has an `--agent` flag (run `openclaw mcp set --help`)
+- If not, check if each agent's `agentDir` supports its own MCP config (e.g. `/Users/openclaw/.openclaw/agents/sunnysidelab/agent/.mcp.json`)
+
+### Signal (Planned)
 - [ ] Signal adapter (signal-cli)
 - [ ] Signal shim
+
+### Discord (Planned)
 - [ ] Discord adapter (serenity)
 - [ ] Discord shim
-- [ ] Gmail adapter
-- [ ] Gmail shim
 
 ---
 
@@ -390,16 +430,15 @@ Once Phase 3 works, we add security layers:
 
 ## Current Focus: Phase 6
 
+Gmail is complete and working end-to-end. Agents can search, read threads, and create drafts. Send is blocked by design.
+
 **What to build next:**
 
-1. **Signal adapter** — wrap `signal-cli` via `tokio::process::Command`
-2. **Signal shim** — CLI binary matching `signal-cli` interface
-3. **Discord adapter** — serenity-based bot adapter
-4. **Discord shim** — CLI binary for Discord messaging
-5. **Gmail adapter** — Google API-based email adapter
-6. **Gmail shim** — CLI binary for Gmail
-
-Phase 5 completed the iMessage channel with full streaming support. Now we add more channels.
+1. **Gmail multi-account** — per-agent MCP servers pointing to separate proxy instances (see design above)
+2. **Signal adapter** — wrap `signal-cli` via `tokio::process::Command`
+3. **Signal shim / MCP server** — same pattern as Gmail
+4. **Discord adapter** — serenity-based bot adapter
+5. **Discord shim / MCP server** — same pattern as Gmail
 
 ---
 

@@ -42,3 +42,14 @@ allowlist = [
 
 [channels.imsg.inbound]
 mode = "open"
+
+# ── Gmail channel ─────────────────────────────────────────────────────────────
+
+[channels.gmail]
+enabled = true
+# Path to the gmail-proxy Unix socket (set by the gmail-proxy daemon on startup).
+proxy_socket = "/var/run/carapace/gmail-proxy.sock"
+
+[channels.gmail.inbound]
+# "open" = deliver all messages; "allowlist" = only from listed senders
+mode = "open"
