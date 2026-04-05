@@ -1,0 +1,27 @@
+[package]
+name = "gdocs-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Secure Google Docs/Drive proxy for Carapace — OAuth, structured content, read/create/copy"
+
+[[bin]]
+name = "gdocs-proxy"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+regex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow = "1"
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+open = "5"
+dirs = "5"
+nix = { version = "0.29", features = ["user", "fs"] }

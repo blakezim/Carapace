@@ -17,6 +17,10 @@ path = "src/bin/imsg_shim.rs"
 name = "gmail-mcp"
 path = "src/bin/gmail_mcp.rs"
 
+[[bin]]
+name = "gdocs-mcp"
+path = "src/bin/gdocs_mcp.rs"
+
 [dependencies]
 carapace-client = { path = "../carapace-client" }
 serde_json.workspace = true

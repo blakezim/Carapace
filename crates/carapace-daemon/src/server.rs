@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 use std::collections::HashMap;
 
+use crate::adapters::gdocs::GDocsAdapter;
 use crate::adapters::gmail::GmailAdapter;
 use crate::adapters::imsg::ImsgAdapter;
 use crate::allowlist::Allowlist;
@@ -39,6 +40,9 @@ pub struct AppState {
     pub gmail_adapters: HashMap<String, GmailAdapter>,
     pub gmail_inbound_allowlists: HashMap<String, Allowlist>,
     pub gmail_default_account: String,
+    // Google Docs channel — keyed by account name
+    pub gdocs_adapters: HashMap<String, GDocsAdapter>,
+    pub gdocs_default_account: String,
 }
 
 impl AppState {
@@ -99,6 +103,26 @@ impl AppState {
             }
         }
 
+        // Build Google Docs adapters — one per configured account.
+        let mut gdocs_adapters = HashMap::new();
+        let mut gdocs_default_account = "default".to_string();
+
+        if let Some(ref gdocs_config) = config.channels.gdocs {
+            if !gdocs_config.enabled {
+                tracing::info!("gdocs channel is disabled in config");
+            } else {
+                gdocs_default_account = gdocs_config.default_account_name().to_string();
+                for (name, account) in gdocs_config.resolve_accounts() {
+                    tracing::info!(
+                        account = %name,
+                        socket = %account.proxy_socket.display(),
+                        "gdocs account enabled"
+                    );
+                    gdocs_adapters.insert(name.clone(), GDocsAdapter::new(account.proxy_socket.clone()));
+                }
+            }
+        }
+
         Self {
             rate_limiter: RateLimiter::new(config.security.rate_limit.clone()),
             content_filter: ContentFilter::new(&config.security.content_filter),
@@ -114,6 +138,8 @@ impl AppState {
             gmail_adapters,
             gmail_inbound_allowlists,
             gmail_default_account,
+            gdocs_adapters,
+            gdocs_default_account,
         }
     }
 }
@@ -343,6 +369,8 @@ async fn process_message(raw: &str, state: &AppState) -> ProcessResult {
             gmail_adapters: &state.gmail_adapters,
             gmail_inbound_allowlists: &state.gmail_inbound_allowlists,
             gmail_default_account: &state.gmail_default_account,
+            gdocs_adapters: &state.gdocs_adapters,
+            gdocs_default_account: &state.gdocs_default_account,
         };
         channel_handler::handle_channel_request(&req, &ctx).await
     } else {

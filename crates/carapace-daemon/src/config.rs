@@ -45,6 +45,7 @@ impl Default for GatewayConfig {
 pub struct ChannelsConfig {
     pub imsg: Option<ImsgChannelConfig>,
     pub gmail: Option<GmailChannelConfig>,
+    pub gdocs: Option<GDocsChannelConfig>,
 }
 
 /// Configuration for the Gmail channel.
@@ -125,6 +126,67 @@ impl GmailChannelConfig {
 
 fn default_gmail_socket() -> PathBuf {
     PathBuf::from("/var/run/carapace/gmail-proxy.sock")
+}
+
+/// Configuration for the Google Docs channel.
+///
+/// Supports multi-account (same pattern as Gmail).
+#[derive(Debug, Deserialize)]
+pub struct GDocsChannelConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Named accounts, each with its own proxy socket.
+    #[serde(default)]
+    pub accounts: Option<HashMap<String, GDocsAccountConfig>>,
+
+    /// Legacy single-account field.
+    #[serde(default)]
+    pub proxy_socket: Option<PathBuf>,
+
+    /// Which account to use when no `account` param is specified.
+    pub default_account: Option<String>,
+}
+
+/// Configuration for a single Google Docs account.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GDocsAccountConfig {
+    pub proxy_socket: PathBuf,
+}
+
+impl GDocsChannelConfig {
+    /// Resolve to a map of account_name → GDocsAccountConfig.
+    pub fn resolve_accounts(&self) -> HashMap<String, GDocsAccountConfig> {
+        if let Some(ref accounts) = self.accounts {
+            accounts.clone()
+        } else if let Some(ref socket) = self.proxy_socket {
+            let mut map = HashMap::new();
+            map.insert(
+                "default".to_string(),
+                GDocsAccountConfig {
+                    proxy_socket: socket.clone(),
+                },
+            );
+            map
+        } else {
+            let mut map = HashMap::new();
+            map.insert(
+                "default".to_string(),
+                GDocsAccountConfig {
+                    proxy_socket: default_gdocs_socket(),
+                },
+            );
+            map
+        }
+    }
+
+    pub fn default_account_name(&self) -> &str {
+        self.default_account.as_deref().unwrap_or("default")
+    }
+}
+
+fn default_gdocs_socket() -> PathBuf {
+    PathBuf::from("/var/run/carapace/gdocs-proxy.sock")
 }
 
 /// Configuration for the iMessage channel.

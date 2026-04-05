@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::adapters::gdocs::GDocsAdapter;
 use crate::adapters::gmail::GmailAdapter;
 use crate::adapters::imsg::ImsgAdapter;
 use crate::allowlist::{Allowlist, AllowlistResult};
@@ -26,6 +27,7 @@ enum Channel<'a> {
         adapter: &'a GmailAdapter,
         inbound: Option<&'a Allowlist>,
     },
+    GDocs(&'a GDocsAdapter),
 }
 
 /// Shared channel state, borrowed from AppState.
@@ -41,6 +43,9 @@ pub struct ChannelContext<'a> {
     pub gmail_adapters: &'a HashMap<String, GmailAdapter>,
     pub gmail_inbound_allowlists: &'a HashMap<String, Allowlist>,
     pub gmail_default_account: &'a str,
+    // Google Docs — keyed by account name
+    pub gdocs_adapters: &'a HashMap<String, GDocsAdapter>,
+    pub gdocs_default_account: &'a str,
 }
 
 /// Handle a `channel.*` JSON-RPC request.
@@ -116,6 +121,30 @@ fn resolve_channel<'a>(
 
             Ok(Channel::Gmail { adapter, inbound })
         }
+        "gdocs" => {
+            if ctx.gdocs_adapters.is_empty() {
+                return Err(JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    protocol::CHANNEL_UNAVAILABLE,
+                    "Google Docs channel is not configured or unavailable",
+                ));
+            }
+            let account = params
+                .get("account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ctx.gdocs_default_account);
+
+            let adapter = ctx.gdocs_adapters.get(account).ok_or_else(|| {
+                JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    protocol::CHANNEL_UNAVAILABLE,
+                    format!("Google Docs account '{}' is not configured. Available: {:?}",
+                        account, ctx.gdocs_adapters.keys().collect::<Vec<_>>()),
+                )
+            })?;
+
+            Ok(Channel::GDocs(adapter))
+        }
         other => Err(JsonRpcResponse::error(
             serde_json::Value::Null,
             protocol::CHANNEL_UNAVAILABLE,
@@ -139,6 +168,74 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
             protocol::METHOD_NOT_FOUND,
             "Gmail channel does not support direct send. Use channel.create_draft instead.",
         );
+    }
+
+    if let Channel::GDocs(adapter) = channel {
+        // GDocs uses channel.send for copy and append operations.
+        let action = req.params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        match action {
+            "copy" => {
+                let file_id = match req.params.get("file_id").and_then(|v| v.as_str()) {
+                    Some(f) => f,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"file_id\""),
+                };
+                let title = req.params.get("title").and_then(|v| v.as_str());
+                match adapter.copy_file(file_id, title).await {
+                    Ok(result) => {
+                        info!(file_id, "gdocs file copied");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs copy failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("copy failed: {e}"));
+                    }
+                }
+            }
+            "append" => {
+                let doc_id = match req.params.get("document_id").and_then(|v| v.as_str()) {
+                    Some(d) => d,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"document_id\""),
+                };
+                let text = match req.params.get("text").and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"text\""),
+                };
+                match adapter.append_text(doc_id, text).await {
+                    Ok(result) => {
+                        info!(doc_id, "gdocs text appended");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs append failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("append failed: {e}"));
+                    }
+                }
+            }
+            "create_folder" => {
+                let name = match req.params.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => n,
+                    None => return JsonRpcResponse::error(req.id.clone(), protocol::INVALID_PARAMS, "Missing required param: \"name\""),
+                };
+                let parent_id = req.params.get("parent_id").and_then(|v| v.as_str());
+                match adapter.create_folder(name, parent_id).await {
+                    Ok(result) => {
+                        info!(name, "gdocs folder created");
+                        return JsonRpcResponse::success(req.id.clone(), result);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "gdocs create_folder failed");
+                        return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_folder failed: {e}"));
+                    }
+                }
+            }
+            _ => {
+                return JsonRpcResponse::error(
+                    req.id.clone(),
+                    protocol::METHOD_NOT_FOUND,
+                    "Google Docs channel.send requires an 'action' param: 'copy', 'append', or 'create_folder'",
+                );
+            }
+        }
     }
 
     let recipient = match req.params.get("recipient").and_then(|v| v.as_str()) {
@@ -198,6 +295,7 @@ async fn handle_send(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcR
             }
         }
         Channel::Gmail { .. } => unreachable!("Gmail send blocked above"),
+        Channel::GDocs(_) => unreachable!("GDocs send handled above"),
     }
 }
 
@@ -228,6 +326,17 @@ async fn handle_list_chats(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Js
                 Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
                 Err(e) => {
                     warn!(error = %e, "gmail list_chats (inbox search) failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("list_chats failed: {e}"))
+                }
+            }
+        }
+        Channel::GDocs(adapter) => {
+            // For GDocs, list_chats returns recent files.
+            let max = limit.unwrap_or(20);
+            match adapter.search("", Some(max), false, None).await {
+                Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
+                Err(e) => {
+                    warn!(error = %e, "gdocs list_chats (file listing) failed");
                     JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("list_chats failed: {e}"))
                 }
             }
@@ -272,6 +381,16 @@ async fn handle_get_history(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> J
                 Ok(thread) => JsonRpcResponse::success(req.id.clone(), thread),
                 Err(e) => {
                     warn!(error = %e, "gmail get_history (get_thread) failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("get_history failed: {e}"))
+                }
+            }
+        }
+        Channel::GDocs(adapter) => {
+            // For GDocs, chat_id is the document ID — read structured content.
+            match adapter.read_document(chat_id).await {
+                Ok(doc) => JsonRpcResponse::success(req.id.clone(), doc),
+                Err(e) => {
+                    warn!(error = %e, "gdocs read_document failed");
                     JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("get_history failed: {e}"))
                 }
             }
@@ -336,6 +455,45 @@ async fn handle_status(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
                 "health": health.map(|h| serde_json::to_value(&h).unwrap()),
                 "inbound": inbound_info,
                 "accounts": ctx.gmail_adapters.keys().collect::<Vec<_>>(),
+            }))
+        }
+        "gdocs" => {
+            let account = req.params.get("account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ctx.gdocs_default_account);
+
+            // If a file_id was passed, return file info instead of health.
+            if let Some(file_id) = req.params.get("file_id").and_then(|v| v.as_str()) {
+                if let Some(adapter) = ctx.gdocs_adapters.get(account) {
+                    match adapter.get_file_info(file_id).await {
+                        Ok(info) => return JsonRpcResponse::success(req.id.clone(), info),
+                        Err(e) => {
+                            warn!(error = %e, "gdocs get_file_info failed");
+                            return JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("get_file_info failed: {e}"));
+                        }
+                    }
+                }
+            }
+
+            let (configured, health) = if let Some(adapter) = ctx.gdocs_adapters.get(account) {
+                (true, Some(adapter.health_check().await))
+            } else if ctx.gdocs_adapters.is_empty() {
+                (false, None)
+            } else {
+                return JsonRpcResponse::error(
+                    req.id.clone(),
+                    protocol::CHANNEL_UNAVAILABLE,
+                    format!("Google Docs account '{}' is not configured. Available: {:?}",
+                        account, ctx.gdocs_adapters.keys().collect::<Vec<_>>()),
+                );
+            };
+
+            JsonRpcResponse::success(req.id.clone(), json!({
+                "channel": "gdocs",
+                "account": account,
+                "configured": configured,
+                "health": health.map(|h| serde_json::to_value(&h).unwrap()),
+                "accounts": ctx.gdocs_adapters.keys().collect::<Vec<_>>(),
             }))
         }
         other => JsonRpcResponse::error(
@@ -418,22 +576,20 @@ async fn handle_watch(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> Process
             let ack = JsonRpcResponse::success(req.id.clone(), json!({"subscribed": true}));
             ProcessResult::Subscription { ack, notifications: rx }
         }
+
+        Channel::GDocs(_) => {
+            ProcessResult::Response(JsonRpcResponse::error(
+                req.id.clone(),
+                protocol::METHOD_NOT_FOUND,
+                "Google Docs channel does not support watch subscriptions",
+            ))
+        }
     }
 }
 
-// ── channel.search (Gmail-specific) ─────────────────────────────────────────
+// ── channel.search ─────────────────────────────────────────
 
 async fn handle_search(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
-    let query = match req.params.get("query").and_then(|v| v.as_str()) {
-        Some(q) if !q.trim().is_empty() => q,
-        _ => {
-            return JsonRpcResponse::error(
-                req.id.clone(), protocol::INVALID_PARAMS,
-                "Missing required param: \"query\"",
-            );
-        }
-    };
-
     let channel = match resolve_channel(&req.params, ctx) {
         Ok(c) => c,
         Err(mut e) => { e.id = req.id.clone(); return e; }
@@ -442,9 +598,18 @@ async fn handle_search(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
     match channel {
         Channel::Imsg(_) => JsonRpcResponse::error(
             req.id.clone(), protocol::METHOD_NOT_FOUND,
-            "channel.search is only supported on the gmail channel",
+            "channel.search is not supported on the imsg channel",
         ),
         Channel::Gmail { adapter, .. } => {
+            let query = match req.params.get("query").and_then(|v| v.as_str()) {
+                Some(q) if !q.trim().is_empty() => q,
+                _ => {
+                    return JsonRpcResponse::error(
+                        req.id.clone(), protocol::INVALID_PARAMS,
+                        "Missing required param: \"query\"",
+                    );
+                }
+            };
             let max = req.params.get("max").and_then(|v| v.as_u64()).map(|n| n as u32);
             let page_token = req.params.get("page_token").and_then(|v| v.as_str());
 
@@ -456,33 +621,27 @@ async fn handle_search(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRp
                 }
             }
         }
+        Channel::GDocs(adapter) => {
+            let query = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let max = req.params.get("max").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let docs_only = req.params.get("docs_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let page_token = req.params.get("page_token").and_then(|v| v.as_str());
+
+            match adapter.search(query, max, docs_only, page_token).await {
+                Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
+                Err(e) => {
+                    warn!(error = %e, "gdocs search failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("search failed: {e}"))
+                }
+            }
+        }
     }
 }
 
 // ── channel.create_draft (Gmail-specific) ───────────────────────────────────
 
 async fn handle_create_draft(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> JsonRpcResponse {
-    let to = match req.params.get("to").and_then(|v| v.as_str()) {
-        Some(t) if !t.trim().is_empty() => t,
-        _ => {
-            return JsonRpcResponse::error(
-                req.id.clone(), protocol::INVALID_PARAMS,
-                "Missing required param: \"to\"",
-            );
-        }
-    };
-    let subject = match req.params.get("subject").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            return JsonRpcResponse::error(
-                req.id.clone(), protocol::INVALID_PARAMS,
-                "Missing required param: \"subject\"",
-            );
-        }
-    };
-    let body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let cc = req.params.get("cc").and_then(|v| v.as_str());
-
+    // Resolve channel first — Gmail and GDocs have different required params.
     let channel = match resolve_channel(&req.params, ctx) {
         Ok(c) => c,
         Err(mut e) => { e.id = req.id.clone(); return e; }
@@ -491,9 +650,30 @@ async fn handle_create_draft(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> 
     match channel {
         Channel::Imsg(_) => JsonRpcResponse::error(
             req.id.clone(), protocol::METHOD_NOT_FOUND,
-            "channel.create_draft is only supported on the gmail channel",
+            "channel.create_draft is only supported on the gmail and gdocs channels",
         ),
         Channel::Gmail { adapter, .. } => {
+            let to = match req.params.get("to").and_then(|v| v.as_str()) {
+                Some(t) if !t.trim().is_empty() => t,
+                _ => {
+                    return JsonRpcResponse::error(
+                        req.id.clone(), protocol::INVALID_PARAMS,
+                        "Missing required param: \"to\"",
+                    );
+                }
+            };
+            let subject = match req.params.get("subject").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    return JsonRpcResponse::error(
+                        req.id.clone(), protocol::INVALID_PARAMS,
+                        "Missing required param: \"subject\"",
+                    );
+                }
+            };
+            let body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let cc = req.params.get("cc").and_then(|v| v.as_str());
+
             match adapter.create_draft(to, subject, body, cc).await {
                 Ok(result) => {
                     info!(to, subject, draft_id = %result.draft_id, "gmail draft created");
@@ -502,6 +682,30 @@ async fn handle_create_draft(req: &JsonRpcRequest, ctx: &ChannelContext<'_>) -> 
                 Err(e) => {
                     warn!(error = %e, "gmail create_draft failed");
                     JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_draft failed: {e}"))
+                }
+            }
+        }
+        Channel::GDocs(adapter) => {
+            let title = match req.params.get("title").and_then(|v| v.as_str()) {
+                Some(t) if !t.trim().is_empty() => t,
+                _ => {
+                    return JsonRpcResponse::error(
+                        req.id.clone(), protocol::INVALID_PARAMS,
+                        "Missing required param: \"title\"",
+                    );
+                }
+            };
+            let content = req.params.get("content").and_then(|v| v.as_str());
+            let folder_id = req.params.get("folder_id").and_then(|v| v.as_str());
+
+            match adapter.create_document(title, content, folder_id).await {
+                Ok(result) => {
+                    info!(title, "gdocs document created");
+                    JsonRpcResponse::success(req.id.clone(), result)
+                }
+                Err(e) => {
+                    warn!(error = %e, "gdocs create_document failed");
+                    JsonRpcResponse::error(req.id.clone(), protocol::INTERNAL_ERROR, format!("create_document failed: {e}"))
                 }
             }
         }
@@ -554,11 +758,16 @@ mod tests {
         HashMap::new()
     }
 
+    fn empty_gdocs_adapters() -> HashMap<String, GDocsAdapter> {
+        HashMap::new()
+    }
+
     fn empty_ctx<'a>(
         audit: &'a AuditLogger,
         dlq: &'a DeadLetterQueue,
         gmail_adapters: &'a HashMap<String, GmailAdapter>,
         gmail_allowlists: &'a HashMap<String, Allowlist>,
+        gdocs_adapters: &'a HashMap<String, GDocsAdapter>,
     ) -> ChannelContext<'a> {
         ChannelContext {
             imsg_adapter: None,
@@ -570,6 +779,8 @@ mod tests {
             gmail_adapters,
             gmail_inbound_allowlists: gmail_allowlists,
             gmail_default_account: "default",
+            gdocs_adapters,
+            gdocs_default_account: "default",
         }
     }
 
@@ -581,7 +792,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.send", json!({"message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -593,7 +805,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.send", json!({"recipient": "+1234567890"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -605,7 +818,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.send", json!({"recipient": "+1234567890", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -625,6 +839,7 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
+        let gda = empty_gdocs_adapters();
         let ctx = ChannelContext {
             imsg_adapter: Some(&adapter),
             imsg_outbound: Some(&outbound),
@@ -635,6 +850,8 @@ mod tests {
             gmail_adapters: &ga,
             gmail_inbound_allowlists: &gal,
             gmail_default_account: "default",
+            gdocs_adapters: &gda,
+            gdocs_default_account: "default",
         };
         let req = make_req("channel.send", json!({"recipient": "+9999999999", "message": "hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
@@ -647,7 +864,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.send", json!({"channel": "signal", "recipient": "+1234567890", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::CHANNEL_UNAVAILABLE);
@@ -659,7 +877,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.unknown", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
@@ -671,7 +890,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.get_history", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
@@ -683,7 +903,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.status", json!({}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         let result = resp.result.unwrap();
@@ -697,7 +918,8 @@ mod tests {
         let dlq = noop_dead_letter();
         let ga = empty_gmail_adapters();
         let gal = empty_gmail_allowlists();
-        let ctx = empty_ctx(&audit, &dlq, &ga, &gal);
+        let gda = empty_gdocs_adapters();
+        let ctx = empty_ctx(&audit, &dlq, &ga, &gal, &gda);
         let req = make_req("channel.status", json!({"channel": "gmail"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
         let result = resp.result.unwrap();
@@ -710,6 +932,7 @@ mod tests {
         let mut ga = HashMap::new();
         ga.insert("default".to_string(), GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock")));
         let gal = empty_gmail_allowlists();
+        let gda = empty_gdocs_adapters();
         let audit = noop_audit();
         let dlq = noop_dead_letter();
         let ctx = ChannelContext {
@@ -722,6 +945,8 @@ mod tests {
             gmail_adapters: &ga,
             gmail_inbound_allowlists: &gal,
             gmail_default_account: "default",
+            gdocs_adapters: &gda,
+            gdocs_default_account: "default",
         };
         let req = make_req("channel.send", json!({"channel": "gmail", "recipient": "a@b.com", "message": "hi"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);
@@ -733,6 +958,7 @@ mod tests {
         let mut ga = HashMap::new();
         ga.insert("default".to_string(), GmailAdapter::new(PathBuf::from("/nonexistent/gmail-proxy.sock")));
         let gal = empty_gmail_allowlists();
+        let gda = empty_gdocs_adapters();
         let audit = noop_audit();
         let dlq = noop_dead_letter();
         let ctx = ChannelContext {
@@ -745,6 +971,8 @@ mod tests {
             gmail_adapters: &ga,
             gmail_inbound_allowlists: &gal,
             gmail_default_account: "default",
+            gdocs_adapters: &gda,
+            gdocs_default_account: "default",
         };
         let req = make_req("channel.create_draft", json!({"channel": "gmail", "subject": "Hello"}));
         let resp = unwrap_response(handle_channel_request(&req, &ctx).await);

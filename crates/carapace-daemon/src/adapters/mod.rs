@@ -3,5 +3,6 @@
 //! Each adapter wraps an external tool or daemon and provides typed methods
 //! for the channel operations the Carapace gateway exposes.
 
+pub mod gdocs;
 pub mod gmail;
 pub mod imsg;

@@ -4,6 +4,7 @@ members = [
     "crates/carapace-client",
     "crates/carapace-shims",
     "crates/gmail-proxy",
+    "crates/gdocs-proxy",
 ]
 resolver = "2"
 
