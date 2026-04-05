@@ -1,147 +1,58 @@
-# Overview & Motivation
+# Carapace Overview
+
+Carapace is a security gateway for AI agents on macOS. It sits between your AI agents (Claude Code, OpenClaw) and sensitive services (iMessage, Gmail, Google Drive) — enforcing allowlists, rate limits, content filtering, and audit logging.
 
 ## The Problem
 
-OpenClaw is a powerful open-source AI assistant that can connect to messaging platforms like iMessage, Signal, Discord, and Gmail. This creates a fundamental security challenge:
+AI agents that can send messages, read email, and access files are powerful — but dangerous if compromised. A prompt injection or jailbreak could:
 
-**The AI that processes untrusted input (messages from the world) has direct access to sensitive credentials and communication tools.**
+- Send messages to anyone in your contacts
+- Exfiltrate sensitive emails or documents
+- Spam recipients or leak credentials
+- Access data the agent was never meant to see
 
-This is like giving a stranger the keys to your house and asking them to sort your mail.
+## The Solution
 
-### OpenClaw's Current Security Model
+Carapace uses **OS-level user isolation** — not just software controls — to enforce security boundaries:
 
-OpenClaw provides multiple security layers:
-
-1. **DM Pairing**: Unknown senders must be approved before the bot processes their messages
-2. **Docker Sandboxing**: Tools can run inside containers to limit blast radius
-3. **Tool Policies**: Allow/deny lists control which tools are available
-4. **Elevated Mode Gates**: Extra controls for host execution
-
-These are good defenses, but they share a critical weakness: **they're all software controls running as your user**.
-
-### What Can Go Wrong
-
-Even with all protections enabled, a sophisticated attack could:
-
-| Attack | How It Works | Impact |
-|--------|--------------|--------|
-| **Direct database access** | Read `~/Library/Messages/chat.db` | All message history leaked |
-| **Credential theft** | Access keychain or config files | Account takeover |
-| **Allowlist modification** | Edit OpenClaw's allowlist files | Remove restrictions |
-| **Audit log tampering** | Delete or modify log files | Cover tracks |
-| **Tool bypass** | Call real `imsg` directly | Skip all filtering |
-
-OpenClaw's own documentation acknowledges this:
-
-> "If you need **stronger isolation between agents, run them under separate OS users or separate hosts**."
-
-> "**Any process/user with filesystem access can read those logs.** Treat disk access as the trust boundary."
-
-## The Solution: OS-Level Isolation
-
-Carapace implements exactly what OpenClaw recommends: **separate OS users**.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    TRUST BOUNDARY                                │
-│                   (OS User Separation)                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   UNTRUSTED SIDE                    TRUSTED SIDE                │
-│   (Your Account)                    (Carapace Account)          │
-│                                                                  │
-│   • Runs OpenClaw                   • Holds all credentials      │
-│   • Processes untrusted input       • Logged into iCloud         │
-│   • Uses shim tools                 • Runs real tools            │
-│   • Cannot access credentials       • Enforces allowlists        │
-│   • Cannot modify allowlists        • Writes audit logs          │
-│                                                                  │
-│   Unix socket is the ONLY           Daemon is the ONLY           │
-│   way to communicate                way to send messages         │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Why This Works
-
-1. **File Permissions Are Kernel-Enforced**
-   - Not software policy—actual OS enforcement
-   - Cannot be bypassed by prompt injection
-   - Cannot be bypassed by bugs or misconfiguration
-
-2. **Credentials Don't Exist in OpenClaw's Context**
-   - Not "hidden" or "restricted"—literally not present
-   - iCloud login is on carapace user
-   - Keychain items are user-specific
-
-3. **Gateway Controls Are Immutable to OpenClaw**
-   - Allowlists stored in carapace's home directory
-   - Audit logs owned by carapace user
-   - Configuration cannot be modified by AI
+- A dedicated `carapace` macOS user owns all sensitive credentials (iCloud, Gmail OAuth tokens)
+- Agents connect through a Unix socket with strict file permissions
+- Every request passes through a security middleware pipeline before reaching any external service
+- No agent can bypass the gateway — the credentials simply aren't accessible to them
 
 ## Design Principles
 
-### 1. Defense in Depth
+| Principle | How Carapace Implements It |
+|-----------|---------------------------|
+| Defense in Depth | Six security layers: file permissions, socket access, protocol restrictions, allowlists, content filtering, audit logging |
+| Least Privilege | Agents can only reach services explicitly configured in the gateway |
+| Fail Secure | Unknown channels, methods, or recipients are denied by default |
+| Transparency | Every request is audit-logged with timestamp, method, parameters, and verdict |
 
-Carapace adds a layer **on top of** OpenClaw's existing security, not replacing it. Use both:
+## What Carapace Manages
 
-- OpenClaw's pairing for initial access control
-- Carapace's isolation for hard boundaries
+| Channel | Capabilities | Restrictions |
+|---------|-------------|-------------|
+| iMessage | Send, receive, list chats, watch for new messages | Outbound allowlist, rate limiting |
+| Gmail | Search, read threads, create drafts | No direct send (drafts only), content scrubbing, blocked label filtering |
+| Google Docs/Drive | Search, read (Docs/Sheets/Slides/Forms), create, copy, folders | No delete, no sharing/permission changes, content scrubbing |
 
-### 2. Principle of Least Privilege
+## Architecture at a Glance
 
-The AI gets exactly what it needs and nothing more:
+```
+Claude Code Agent (Jarvis)          Claude Code Agent (Wedding)
+    |                                   |
+    | MCP (gmail-mcp, gdocs-mcp)        | MCP (gmail-mcp, gdocs-mcp)
+    v                                   v
+carapace-daemon  <-- Unix socket (/var/run/carapace/gateway.sock)
+    |
+    |-- Security middleware (allowlist, rate limit, content filter, audit)
+    |
+    +-- gmail-proxy (OAuth, content scrubbing) --> Gmail API
+    +-- gdocs-proxy (OAuth, structured read)   --> Drive/Docs/Sheets/Slides/Forms API
+    +-- imsg adapter                           --> Messages.app
+```
 
-- ✅ Send messages to allowlisted recipients
-- ✅ Receive messages from allowlisted senders
-- ❌ Direct database access
-- ❌ Credential access
-- ❌ Configuration changes
+## Who This Is For
 
-### 3. Fail Secure
-
-When in doubt, block:
-
-- Unknown recipients → blocked, logged to dead letter queue
-- Rate limit exceeded → blocked, request denied
-- Suspicious content → blocked, alert logged
-- Socket connection fails → OpenClaw sees error, not credentials
-
-### 4. Transparency
-
-- Shims emulate real tool behavior exactly
-- Audit logs capture all activity
-- Dead letter queue preserves blocked request metadata
-- No hidden behaviors
-
-## Who Should Use Carapace
-
-### Recommended For
-
-- **Multi-user bots**: When multiple people can message your AI
-- **High-value credentials**: When compromise would be costly
-- **Compliance requirements**: When you need provable isolation
-- **Peace of mind**: When you want hard guarantees, not "probably safe"
-
-### May Be Overkill For
-
-- **Personal-only use**: Just you messaging your own AI
-- **No sensitive channels**: AI only uses web search, no messaging
-- **Ephemeral setups**: Testing or development environments
-
-## Comparison with Alternatives
-
-| Approach | Isolation | Setup Complexity | Credential Safety |
-|----------|-----------|------------------|-------------------|
-| OpenClaw (default) | Software | Simple | Software controls |
-| OpenClaw + Docker | Container | Moderate | Gateway still has access |
-| OpenClaw + Carapace | OS User | Moderate | **Kernel enforced** |
-| Separate machine | Hardware | Complex | Network isolated |
-
-Carapace provides the strongest practical isolation for single-machine deployments.
-
-## Next Steps
-
-- [Architecture](02-architecture.md) - Technical details of how Carapace works
-- [Security Model](03-security-model.md) - Detailed threat analysis
-- [Setup Guide](04-setup-carapace-user.md) - Get started with installation
+Carapace is purpose-built for a single Mac running AI agents that interact with real messaging and productivity services. It's not a general-purpose API gateway — it's a personal security layer for autonomous AI assistants.

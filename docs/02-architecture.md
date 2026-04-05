@@ -1,306 +1,110 @@
 # Architecture
 
-## System Overview
-
-Carapace consists of four main components:
-
-1. **Shim Tools** - Drop-in replacements that redirect to the gateway
-2. **Unix Domain Socket** - Secure IPC channel between users
-3. **Carapace Daemon** - Security gateway running as carapace user
-4. **Channel Adapters** - Integrations with real messaging tools
+## System Components
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              CARAPACE ARCHITECTURE                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  YOUR ACCOUNT                              CARAPACE ACCOUNT                  │
-│  ────────────────                          ─────────────────                 │
-│                                                                              │
-│  ┌──────────────────┐                      ┌────────────────────────────┐   │
-│  │   OpenClaw       │                      │   Carapace Daemon          │   │
-│  │   Gateway        │                      │                            │   │
-│  └────────┬─────────┘                      │  ┌──────────────────────┐  │   │
-│           │                                │  │  Socket Listener     │  │   │
-│           │ calls                          │  └──────────┬───────────┘  │   │
-│           ▼                                │             │              │   │
-│  ┌──────────────────┐                      │             ▼              │   │
-│  │   Shim Tools     │                      │  ┌──────────────────────┐  │   │
-│  │                  │    JSON-RPC          │  │  Request Router      │  │   │
-│  │  /usr/local/     │    over Unix         │  └──────────┬───────────┘  │   │
-│  │  carapace/bin/   │    Socket            │             │              │   │
-│  │                  │◄────────────────────►│             ▼              │   │
-│  │  • imsg          │                      │  ┌──────────────────────┐  │   │
-│  │  • signal-cli    │                      │  │  Security Middleware │  │   │
-│  │  • discord-cli   │                      │  │                      │  │   │
-│  │  • gog           │                      │  │  • Rate Limiter      │  │   │
-│  │                  │                      │  │  • Allowlist         │  │   │
-│  └──────────────────┘                      │  │  • Content Filter    │  │   │
-│                                            │  │  • Audit Logger      │  │   │
-│  PATH has shims first                      │  └──────────┬───────────┘  │   │
-│  Real tools not in PATH                    │             │              │   │
-│                                            │             ▼              │   │
-│                                            │  ┌──────────────────────┐  │   │
-│                                            │  │  Channel Adapters    │  │   │
-│                                            │  │                      │  │   │
-│                                            │  │  • ImsgAdapter       │  │   │
-│                                            │  │  • SignalAdapter     │  │   │
-│                                            │  │  • DiscordAdapter    │  │   │
-│                                            │  │  • GmailAdapter      │  │   │
-│                                            │  └──────────┬───────────┘  │   │
-│                                            │             │              │   │
-│                                            │             ▼              │   │
-│                                            │  ┌──────────────────────┐  │   │
-│                                            │  │  Real Tools          │  │   │
-│                                            │  │                      │  │   │
-│                                            │  │  • /opt/homebrew/    │  │   │
-│                                            │  │    bin/imsg          │  │   │
-│                                            │  │  • signal-cli        │  │   │
-│                                            │  │  • Discord.js        │  │   │
-│                                            │  │  • Gmail API         │  │   │
-│                                            │  └──────────────────────┘  │   │
-│                                            │                            │   │
-│                                            │  Files owned by carapace:  │   │
-│                                            │  • ~/.config/carapace/     │   │
-│                                            │  • ~/Library/Messages/     │   │
-│                                            │  • Keychain credentials    │   │
-│                                            └────────────────────────────┘   │
-│                                                                              │
-│  SOCKET: /var/run/carapace/gateway.sock                                     │
-│  OWNER: carapace:carapace-clients                                            │
-│  PERMS: srwxrwx--- (770)                                                     │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
++---------------------------+     +---------------------------+
+|  blakezimmerman (main)    |     |  carapace (service user)  |
+|                           |     |                           |
+|  Claude Code agents       |     |  carapace-daemon          |
+|  (Jarvis, Wedding)        |     |  gmail-proxy (x2)         |
+|                           |     |  gdocs-proxy (x2)         |
+|  MCP servers:             |     |  Messages.app (GUI)       |
+|    gmail-mcp              |     |  imsg binary              |
+|    gdocs-mcp              |     |                           |
++-------------|-------------+     +-------------|-------------+
+              |                                 |
+              +--- Unix socket -----------------+
+                   /var/run/carapace/gateway.sock
+                   (mode 0770, group: carapace-clients)
 ```
 
-## Component Details
+## User Model
 
-### 1. Shim Tools
+| User | Purpose | What It Owns |
+|------|---------|-------------|
+| `blakezimmerman` | Main account, runs Claude Code agents | Agent configs, SSH keys, code repos |
+| `carapace` | Service account, owns all sensitive credentials | iCloud account, Gmail OAuth tokens, GDocs OAuth tokens, Messages.app |
+| `openclaw` | Legacy agent runtime (being decommissioned) | OpenClaw config and logs |
 
-Shims are lightweight binaries that emulate the CLI interface of real tools but redirect all operations through the gateway.
+The `carapace-clients` group grants socket access. Both `blakezimmerman` and `openclaw` are members.
 
-**Location:** `/usr/local/carapace/bin/`
+## Daemon (carapace-daemon)
 
-**Behavior:**
-```bash
-# User runs:
-imsg send "+1234567890" "Hello"
-
-# This is actually the shim, which:
-# 1. Parses CLI arguments
-# 2. Connects to Unix socket
-# 3. Sends JSON-RPC request
-# 4. Receives response
-# 5. Formats output exactly like real imsg
-```
-
-**Key Properties:**
-- Exact CLI compatibility with real tools
-- No credentials or sensitive data
-- Fails gracefully if daemon unavailable
-- Stateless (no local storage)
-
-### 2. Unix Domain Socket
-
-The socket provides secure IPC between your account and the carapace daemon.
-
-**Location:** `/var/run/carapace/gateway.sock`
-
-**Why Unix Sockets?**
-
-| Property | Unix Socket | TCP Loopback | Named Pipe |
-|----------|-------------|--------------|------------|
-| Network exposure | None | Localhost only | None |
-| Permission control | File permissions | Port access | File permissions |
-| Performance | Fast | Moderate | Fast |
-| Cross-platform | Unix/macOS | Universal | Windows-focused |
-
-**Permission Model:**
-```
-Socket: /var/run/carapace/gateway.sock
-Owner: carapace
-Group: carapace-clients
-Mode: srwxrwx--- (770)
-
-Directory: /var/run/carapace/
-Owner: carapace
-Group: carapace-clients
-Mode: drwxr-x--- (750)
-```
-
-Only the carapace user and members of `carapace-clients` group can connect.
-
-### 3. Carapace Daemon
-
-The daemon is the security gateway. It runs as the carapace user and is the only component with access to credentials.
+The central gateway process. Runs as `carapace` via LaunchDaemon.
 
 **Responsibilities:**
-- Listen on Unix socket
-- Authenticate incoming connections
-- Route requests to appropriate channel adapters
-- Enforce security policies (rate limit, allowlist, content filter)
-- Log all activity
-- Manage dead letter queue
+- Listen on Unix socket for JSON-RPC requests
+- Route requests to channel adapters (iMessage, Gmail, GDocs)
+- Enforce security middleware on every request
+- Manage watch subscriptions for real-time message streaming
 
-**Process Model:**
-```
-carapace-daemon (main process)
-├── Socket listener (async)
-├── Request handler pool
-├── Channel adapter threads
-│   ├── imsg watch (if enabled)
-│   ├── signal receive (if enabled)
-│   └── discord events (if enabled)
-└── Maintenance tasks
-    ├── Log rotation
-    ├── Rate limit cleanup
-    └── Config reload watcher
-```
+**Security middleware pipeline (every request):**
+1. Rate limiting (per-channel, configurable)
+2. Content filtering (regex patterns, block/warn)
+3. Allowlist enforcement (per-channel, per-direction)
+4. Audit logging (all requests with verdict)
+5. Dead letter storage (blocked messages saved for review)
 
-### 4. Channel Adapters
+## Channel Proxies
 
-Each messaging platform has a dedicated adapter that knows how to interact with the real tools.
+Each external service has a dedicated proxy that handles OAuth and API-specific concerns:
 
-**Adapter Interface:**
-```rust
-trait ChannelAdapter {
-    /// Send a message
-    async fn send(&self, request: SendRequest) -> Result<SendResponse>;
+### gmail-proxy
+- Manages OAuth 2.0 token refresh
+- Content scrubbing (OTP redaction, auth URL stripping)
+- Label-based filtering (AI-BLOCKED label hides messages)
+- Query validation (blocks access to trash/spam/drafts)
+- One instance per Gmail account
 
-    /// Subscribe to incoming messages
-    async fn receive(&self) -> impl Stream<Item = IncomingMessage>;
+### gdocs-proxy
+- Manages OAuth 2.0 token refresh for Drive/Docs/Sheets/Slides/Forms
+- Auto-detects file type and routes to correct Google API
+- Structured content output (headings, tables, cell data, slide text)
+- Content scrubbing with configurable redact patterns
+- No delete or share endpoints exposed
+- One instance per Google account
 
-    /// List conversations
-    async fn list_chats(&self, limit: u32) -> Result<Vec<Chat>>;
+## MCP Servers
 
-    /// Get message history
-    async fn get_history(&self, chat_id: &str, limit: u32) -> Result<Vec<Message>>;
+MCP (Model Context Protocol) servers bridge between Claude Code agents and the Carapace gateway:
 
-    /// Check channel health
-    async fn status(&self) -> ChannelStatus;
-}
-```
+| Server | Binary | Tools |
+|--------|--------|-------|
+| gmail-mcp | `/usr/local/bin/gmail-mcp` | gmail_search, gmail_read_thread, gmail_create_draft, gmail_status |
+| gdocs-mcp | `/usr/local/bin/gdocs-mcp` | gdocs_search, gdocs_read, gdocs_file_info, gdocs_create, gdocs_copy, gdocs_append, gdocs_create_folder, gdocs_status |
 
-## Data Flow
+MCP servers are spawned per-agent-session by Claude Code. They connect to the gateway socket on first tool call.
 
-### Outbound Message (AI → World)
+## Data Flow (outbound Gmail draft example)
 
 ```
-1. OpenClaw decides to send a message
-   └─► Calls: imsg send "+1234567890" "Hello"
-
-2. Shim receives command
-   └─► Parses arguments
-   └─► Connects to /var/run/carapace/gateway.sock
-
-3. Shim sends JSON-RPC request
-   └─► {"jsonrpc":"2.0","method":"channel.send","params":{...}}
-
-4. Daemon receives request
-   └─► Authenticates connection (group membership)
-
-5. Security middleware checks
-   ├─► Rate limiter: Is this within limits?
-   ├─► Allowlist: Is recipient approved?
-   ├─► Content filter: Any blocked patterns?
-   └─► Audit logger: Record the attempt
-
-6. If BLOCKED:
-   └─► Log to dead letter queue
-   └─► Return error to shim
-
-7. If ALLOWED:
-   └─► Channel adapter executes real command
-   └─► As carapace user with real credentials
-   └─► Return success to shim
-
-8. Shim formats response
-   └─► Prints output matching real imsg format
+Agent calls gmail_create_draft("alice@example.com", "Hello", "...")
+    |
+    v
+gmail-mcp: JSON-RPC call to gateway socket
+    |
+    v
+carapace-daemon: rate limit check -> content filter -> audit log
+    |
+    v
+GmailAdapter: HTTP POST to gmail-proxy Unix socket
+    |
+    v
+gmail-proxy: OAuth token refresh -> Gmail API drafts.create
+    |
+    v
+Response flows back up the chain
 ```
 
-### Inbound Message (World → AI)
+## Socket Layout
 
-```
-1. Real message arrives
-   └─► imsg watch detects new message (as carapace user)
+All sockets live in `/var/run/carapace/` (created at boot by `ai.carapace.setup`):
 
-2. Channel adapter receives event
-   └─► Parses message metadata
-
-3. Inbound security check
-   ├─► Is sender in inbound allowlist?
-   └─► Audit logger: Record receipt
-
-4. If BLOCKED:
-   └─► Message hidden from OpenClaw
-   └─► Logged for review
-
-5. If ALLOWED:
-   └─► Forward to connected shim streams
-   └─► OpenClaw sees the message
-```
-
-## Security Boundaries
-
-### What Your Account CAN Do
-
-- Connect to the Unix socket (via group membership)
-- Send requests through the gateway
-- Receive responses and message streams
-- See error messages when blocked
-
-### What Your Account CANNOT Do
-
-- Access carapace user's files
-- Read the message database directly
-- Modify allowlists or configuration
-- Bypass rate limiting
-- See the audit logs (read-only access could be granted)
-- Access credentials or tokens
-
-### What Carapace Account CAN Do
-
-- Read and write all messaging databases
-- Access all configured credentials
-- Send messages to anyone (but only via daemon)
-- Modify configuration
-- Read and write audit logs
-
-## Failure Modes
-
-| Failure | Behavior | Recovery |
-|---------|----------|----------|
-| Daemon not running | Shims return connection error | Start daemon |
-| Socket permissions wrong | Shims return permission denied | Fix permissions |
-| Channel adapter crash | That channel unavailable | Daemon restarts adapter |
-| Config file invalid | Daemon refuses to start | Fix config, restart |
-| Rate limit exceeded | Requests denied with error | Wait for limit reset |
-| Disk full | Audit logs may fail | Free space |
-
-## Performance Considerations
-
-### Latency
-
-Each request adds ~1-5ms for:
-- Socket connection
-- JSON serialization
-- Security checks
-- Response formatting
-
-This is negligible for messaging use cases.
-
-### Throughput
-
-The daemon can handle hundreds of requests per second. Rate limiting is the practical constraint, not system performance.
-
-### Memory
-
-- Daemon: ~20-50MB baseline
-- Per shim process: ~5MB
-- Audit logs: ~1KB per entry (rotated)
-
-## Next Steps
-
-- [Security Model](03-security-model.md) - Detailed threat analysis
-- [Protocol Specification](06-protocol-spec.md) - JSON-RPC details
-- [Daemon Implementation](07-daemon-implementation.md) - Building the daemon
+| Socket | Owner | Purpose |
+|--------|-------|---------|
+| `gateway.sock` | carapace:carapace-clients (0770) | Main gateway |
+| `gmail-proxy.sock` | carapace:carapace-clients (0660) | Primary Gmail |
+| `gmail-proxy-automations.sock` | carapace:carapace-clients (0660) | Automations Gmail |
+| `gdocs-proxy-hq.sock` | carapace:carapace-clients (0660) | Primary GDocs |
+| `gdocs-proxy-automations.sock` | carapace:carapace-clients (0660) | Automations GDocs |
