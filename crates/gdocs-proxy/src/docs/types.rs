@@ -31,6 +31,8 @@ pub struct DriveFile {
     pub starred: Option<bool>,
     #[serde(default)]
     pub trashed: Option<bool>,
+    #[serde(default)]
+    pub parents: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

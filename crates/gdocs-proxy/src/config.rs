@@ -29,6 +29,10 @@ pub struct ScrubConfig {
     /// Regex patterns to redact from document content (e.g. OTPs, tokens).
     #[serde(default)]
     pub redact_patterns: Vec<String>,
+    /// Folder IDs that are blocked from search results and reads.
+    /// Files anywhere inside these folders (including nested subfolders) are hidden.
+    #[serde(default)]
+    pub blocked_folders: Vec<String>,
 }
 
 impl Default for ScrubConfig {
@@ -36,6 +40,7 @@ impl Default for ScrubConfig {
         Self {
             strip_links: false,
             redact_patterns: vec![],
+            blocked_folders: vec![],
         }
     }
 }

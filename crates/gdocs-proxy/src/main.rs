@@ -98,11 +98,19 @@ async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .map(|p| regex::Regex::new(p).unwrap())
         .collect();
 
+    if !cfg.scrub.blocked_folders.is_empty() {
+        tracing::info!(
+            count = cfg.scrub.blocked_folders.len(),
+            "Blocked folders configured"
+        );
+    }
+
     let state = Arc::new(AppState {
         docs,
         token_manager: token_manager.clone(),
         scrub_patterns,
         strip_links: cfg.scrub.strip_links,
+        blocked_folders: cfg.scrub.blocked_folders.clone(),
         start_time: std::time::Instant::now(),
     });
 

@@ -82,12 +82,47 @@ impl DocsClient {
             .http_client
             .get(format!("{}/files/{file_id}", self.drive_base_url))
             .header("Authorization", &auth)
-            .query(&[("fields", "id,name,mimeType,createdTime,modifiedTime,owners,webViewLink,starred,trashed")])
+            .query(&[("fields", "id,name,mimeType,createdTime,modifiedTime,owners,webViewLink,starred,trashed,parents")])
             .send()
             .await
             .context("Drive get_file request failed")?;
         let resp = check_status(resp, "Drive get_file").await?;
         resp.json().await.context("failed to deserialize file metadata")
+    }
+
+    /// Check if a file is inside any of the blocked folders by walking up the parent chain.
+    /// Returns true if blocked.
+    pub async fn is_in_blocked_folder(&self, file_id: &str, blocked_folders: &[String]) -> bool {
+        if blocked_folders.is_empty() {
+            return false;
+        }
+        // Check if this file IS a blocked folder.
+        if blocked_folders.iter().any(|f| f == file_id) {
+            return true;
+        }
+        // Walk up the parent chain.
+        let mut current_id = file_id.to_string();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(current_id.clone()) {
+                return false; // cycle protection
+            }
+            let file = match self.get_file(&current_id).await {
+                Ok(f) => f,
+                Err(_) => return false, // can't read → not blocked
+            };
+            let parents = match file.parents {
+                Some(ref p) if !p.is_empty() => p.clone(),
+                _ => return false, // reached root
+            };
+            for parent in &parents {
+                if blocked_folders.iter().any(|f| f == parent) {
+                    return true;
+                }
+            }
+            // Continue up with the first parent.
+            current_id = parents[0].clone();
+        }
     }
 
     /// Create a folder in Google Drive. Optionally place it inside a parent folder.

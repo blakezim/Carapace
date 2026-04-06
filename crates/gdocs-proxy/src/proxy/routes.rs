@@ -27,6 +27,7 @@ pub struct AppState {
     pub token_manager: Arc<TokenManager>,
     pub scrub_patterns: Vec<regex::Regex>,
     pub strip_links: bool,
+    pub blocked_folders: Vec<String>,
     pub start_time: std::time::Instant,
 }
 
@@ -94,13 +95,19 @@ async fn search_handler(
             )
         })?;
 
-    let files: Vec<_> = result
-        .files
-        .unwrap_or_default()
-        .iter()
-        .filter(|f| !f.trashed.unwrap_or(false))
-        .map(|f| f.to_result())
-        .collect();
+    let raw_files = result.files.unwrap_or_default();
+    let mut files = Vec::new();
+    for f in &raw_files {
+        if f.trashed.unwrap_or(false) {
+            continue;
+        }
+        if !state.blocked_folders.is_empty()
+            && state.docs.is_in_blocked_folder(&f.id, &state.blocked_folders).await
+        {
+            continue;
+        }
+        files.push(f.to_result());
+    }
 
     Ok(Json(serde_json::json!({
         "files": files,
@@ -116,7 +123,17 @@ async fn get_doc_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // First, get the file metadata to determine the type.
+    // Check blocked folders first.
+    if !state.blocked_folders.is_empty()
+        && state.docs.is_in_blocked_folder(&id, &state.blocked_folders).await
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        ));
+    }
+
+    // Get the file metadata to determine the type.
     let file = state.docs.get_file(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -208,6 +225,15 @@ async fn get_file_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.blocked_folders.is_empty()
+        && state.docs.is_in_blocked_folder(&id, &state.blocked_folders).await
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        ));
+    }
+
     let file = state.docs.get_file(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -475,6 +501,15 @@ async fn copy_handler(
     Path(id): Path<String>,
     Query(params): Query<CopyParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.blocked_folders.is_empty()
+        && state.docs.is_in_blocked_folder(&id, &state.blocked_folders).await
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        ));
+    }
+
     let new_file = state
         .docs
         .copy_file(&id, params.title.as_deref())
